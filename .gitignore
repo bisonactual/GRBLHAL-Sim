@@ -1,0 +1,5 @@
+build/
+plugins/
+EEPROM.DAT
+*.o
+*.exe

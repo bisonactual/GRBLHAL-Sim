@@ -10,6 +10,9 @@
 /* Provide stub definitions for hardware macros that plugins may reference */
 #include "sim_stubs.h"
 
+/* Pull in the full grblHAL API — plugins expect driver.h to provide this */
+#include "grbl/hal.h"
+
 #define portINT(p) portQ(p)
 #define portQ(p) GPIO ## p ## _IRQ
 

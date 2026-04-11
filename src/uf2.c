@@ -714,28 +714,55 @@ static void handle_rebuild(socket_t fd)
         return;
     }
 
-    char output[8192] = {0};
-    size_t olen = 0;
-    char line[256];
-    while (fgets(line, sizeof(line), proc) && olen < sizeof(output) - 256) {
-        olen += snprintf(output + olen, sizeof(output) - olen, "%s", line);
-        printf("[BUILD] %s", line);
+    /* Ring-buffer approach: keep the last ~60KB of output so errors aren't truncated */
+    #define BUILD_BUF_SIZE (64 * 1024)
+    char *output = calloc(1, BUILD_BUF_SIZE);
+    if (!output) {
+        pclose(proc);
+        send_text(fd, "500 Internal Server Error", "ERROR: Out of memory");
+        return;
     }
+    size_t olen = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), proc)) {
+        size_t llen = strlen(line);
+        printf("[BUILD] %s", line);
+        if (olen + llen < BUILD_BUF_SIZE - 1) {
+            memcpy(output + olen, line, llen);
+            olen += llen;
+        } else {
+            /* Buffer full — shift to keep the tail */
+            size_t keep = BUILD_BUF_SIZE / 2;
+            memmove(output, output + olen - keep, keep);
+            olen = keep;
+            memcpy(output + olen, line, llen);
+            olen += llen;
+        }
+    }
+    output[olen] = '\0';
     int ret = pclose(proc);
 
     if (ret == 0) {
         rebuild_requested = true;
-        char msg[256];
-        snprintf(msg, sizeof(msg),
+        send_text(fd, "200 OK",
             "OK: Build succeeded. Restart the simulator to load new plugins.");
-        send_text(fd, "200 OK", msg);
         printf("[PLUGIN] Build succeeded\n");
     } else {
-        char msg[8192 + 64];
-        snprintf(msg, sizeof(msg), "ERROR: Build failed (exit %d):\n%s", ret, output);
-        send_text(fd, "500 Internal Server Error", msg);
+        /* Send last ~8KB to the HTTP client (response size limit) */
+        const size_t max_resp = 8000;
+        const char *tail = (olen > max_resp) ? output + olen - max_resp : output;
+        char *msg = malloc(max_resp + 128);
+        if (msg) {
+            snprintf(msg, max_resp + 128, "ERROR: Build failed (exit %d):\n%s", ret, tail);
+            send_text(fd, "500 Internal Server Error", msg);
+            free(msg);
+        } else {
+            send_text(fd, "500 Internal Server Error", "ERROR: Build failed (out of memory for log)");
+        }
         printf("[PLUGIN] Build failed (exit %d)\n", ret);
     }
+    free(output);
+    #undef BUILD_BUF_SIZE
 }
 
 /* ── Public API ─────────────────────────────────────────────────────────── */

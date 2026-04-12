@@ -1,0 +1,4 @@
+build/
+EEPROM.DAT
+*.o
+*.exe

@@ -1,3 +1,13 @@
+This simulator is built for the rapid development of [Flexisender](https://github.com/bisonactual/Flexisender2). You can use it alongside flexisender to run a simulated env. stdin is available, so you can simulate physical triggers which show up in Flexisender. You can also use it to test any other sender. 
+
+Connection is only over websocket. Web stack is not simulated, it's just existent to connect.
+
+Currently has a hard build of the dev branch atc plugin from expatria included. You can rapidly add and test your small plugins by pushing them to the rapid plugin builder - it recompiles to add your plugin on the fly. I use this on WSL in windows, but it should work on windows/linux. Give it to a clanker and it'll sort out minor issues. 
+
+SD Card is mounted in /build/sdcard and provides 1gb for various shenanigans. EEPROM is where the 'hardware memory' lives. 
+
+Clanker output below :)
+
 # grblHAL FlexiHAL Simulator
 
 A cross-platform simulator for CNC controllers running [grblHAL](https://github.com/grblHAL) firmware. Compiles the real grblHAL core with a virtual HAL driver that emulates the [Expatria FlexiHAL](https://github.com/Expatria-Technologies/Flexi-HAL) controller.

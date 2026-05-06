@@ -11,6 +11,7 @@
 #include <stdlib.h>
 
 #include "eeprom.h"
+#include "grbl/crc.h"
 #include "grbl/hal.h"
 
 #define EEPROM_SIZE 16384  // 16K to match FlexiHAL's 128 (16K) EEPROM

@@ -1,0 +1,85 @@
+name: Build
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git
+      - name: Package
+        run: ./packaging/linux/package-linux.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grblhal-flexihal-sim-linux-x64
+          path: dist/grblhal-flexihal-sim-linux-x64.tar.gz
+
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Package
+        shell: powershell
+        run: .\packaging\windows\package-windows.ps1
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grblhal-flexihal-sim-windows-x64
+          path: dist/grblhal-flexihal-sim-windows-x64.zip
+
+  macos:
+    name: macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Package
+        run: ./packaging/macos/package-macos.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grblhal-flexihal-sim-macos
+          path: dist/grblhal-flexihal-sim-macos-*.tar.gz
+
+  release:
+    name: Tagged prerelease
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Create or update GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release-assets/* --clobber
+          else
+            gh release create "$TAG_NAME" release-assets/* --title "$TAG_NAME" --prerelease --generate-notes
+          fi

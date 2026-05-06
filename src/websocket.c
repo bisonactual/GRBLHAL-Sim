@@ -120,6 +120,7 @@ static void base64_encode(const uint8_t *in, size_t len, char *out)
 static socket_t listen_fd = SOCK_INVALID;
 static socket_t client_fd = SOCK_INVALID;
 static bool ws_handshake_done = false;
+static bool ws_tx_muted = false;
 
 // Receive ring buffer
 #define WS_RX_BUF_SIZE 4096
@@ -460,6 +461,10 @@ uint8_t ws_getchar(void)
 void ws_putchar(uint8_t data)
 {
     if (client_fd == SOCK_INVALID || !ws_handshake_done) return;
+    if (ws_tx_muted) {
+        tx_len = 0;
+        return;
+    }
 
     tx_buf[tx_len++] = data;
 
@@ -468,6 +473,27 @@ void ws_putchar(uint8_t data)
         ws_send_frame(tx_buf, tx_len);
         tx_len = 0;
     }
+}
+
+bool ws_toggle_tx_muted(void)
+{
+    ws_tx_muted = !ws_tx_muted;
+    if (ws_tx_muted)
+        tx_len = 0;
+    return ws_tx_muted;
+}
+
+bool ws_kick_client(void)
+{
+    if (client_fd == SOCK_INVALID)
+        return false;
+
+    sock_close(client_fd);
+    client_fd = SOCK_INVALID;
+    ws_handshake_done = false;
+    raw_len = 0;
+    tx_len = 0;
+    return true;
 }
 
 void ws_shutdown(void)

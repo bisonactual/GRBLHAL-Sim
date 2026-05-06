@@ -17,6 +17,7 @@
 #include "fs_sim.h"
 
 #include "grbl/hal.h"
+#include "grbl/gcode.h"
 
 #ifndef SQUARING_ENABLED
 #define SQUARING_ENABLED 0
@@ -247,6 +248,24 @@ void sim_process_realtime(uint_fast16_t state)
 
 uint32_t millis(void) { return ticks; }
 
+/* Simulated homing: zero position for requested axes and mark them homed. */
+static bool sim_home_machine(axes_signals_t cycle, axes_signals_t auto_square)
+{
+    uint_fast8_t idx = N_AXIS;
+
+    do {
+        idx--;
+        if (bit_istrue(cycle.mask, bit(idx)))
+            sys.position[idx] = 0;
+    } while (idx);
+
+    sys.homed.mask |= cycle.mask;
+
+    sync_position();
+
+    return true;
+}
+
 bool driver_init(void)
 {
     mcu_reset();
@@ -299,6 +318,9 @@ bool driver_init(void)
 
     hal.control.get_state = systemGetState;
 
+    /* Simulated homing — no real switches, just zero position and mark homed */
+    grbl.home_machine = sim_home_machine;
+
     memcpy(&hal.stream, serialInit(), sizeof(io_stream_t));
     hal.nvs.type = NVS_EEPROM;
     hal.nvs.get_byte = eeprom_get_char;
@@ -322,12 +344,9 @@ bool driver_init(void)
     hal.driver_cap.limits_pull_up = On;
     hal.driver_cap.probe_pull_up = On;
 
-    // Initialize dynamically-loaded plugins.
+    // Initialize bundled simulator plugins.
     // NOTE: we call my_plugin_init() directly instead of #include "grbl/plugins_init.h"
-    // because plugins_init.h has #if XXXX_ENABLE blocks that would double-init any
-    // plugin whose enable macro is defined — our CMake auto-discovery sets those macros
-    // for the compiler, so plugins_init.h would call e.g. atci_init() a second time
-    // on top of the call already in my_plugin_init().
+    // so the simulator controls exactly which FlexiHAL profile plugins are active.
     extern void my_plugin_init(void);
     my_plugin_init();
 

@@ -32,7 +32,7 @@
 #include <string.h>
 
 #if SDCARD_ENABLE
-/* stripped: #include "sdcard/sdcard.h" (not found in plugins/) */
+/* sdcard/sdcard.h — not available in simulator, early_mount stubbed in fs_sim */
 #endif
 
 #include "grbl/vfs.h"
@@ -42,72 +42,7 @@
 #include "grbl/core_handlers.h"
 #include "grbl/state_machine.h"
 
-/* ---- inlined from tooltable.h ---- */
-/*
-  tooltable.h - file based tooltable, LinuxCNC format
-
-  Part of grblHAL
-
-  Copyright (c) 2025 Terje Io
-
-  grblHAL is free software: you can redistribute it and/or modify
-  it under the terms of the GNU General Public License as published by
-  the Free Software Foundation, either version 3 of the License, or
-  (at your option) any later version.
-
-  grblHAL is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with grblHAL. If not, see <http://www.gnu.org/licenses/>.
-*/
-
-#pragma once
-
-#include "grbl/gcode.h"
-
-// Result codes for carousel operations
-typedef enum {
-    CarouselOp_OK = 0,
-    CarouselOp_AlreadyRegistered,   // tool already at P0, no change made
-    CarouselOp_ToolNotFound,        // tool_id not in tooltable
-    CarouselOp_ToolAlreadyInPocket, // tool already has a pocket assigned
-    CarouselOp_NoPocketAvailable,   // carousel is full
-    CarouselOp_WriteError,          // tooltable file write failed
-    CarouselOp_TableNotLoaded       // tooltable not yet loaded
-} carousel_op_result_t;
-
-void tooltable_set_max_pockets (uint16_t n);
-
-// Return the name/comment string for a tool from the RAM index.
-// Returns NULL if the tool is not indexed or has no name.
-const char *tooltable_get_name (tool_id_t tool_id);
-
-// Register a tool in the tooltable at P0 (not in the carousel).
-// If the tool already exists its name is updated if name is non-NULL.
-// If the tool already has a pocket assigned, returns CarouselOp_ToolAlreadyInPocket.
-carousel_op_result_t tooltable_register_tool (tool_id_t tool_id, const char *name);
-
-// Add a tool to the carousel.
-// Finds the lowest-numbered free pocket, assigns the tool to it, and
-// persists the change to the tooltable file.
-// Returns CarouselOp_OK on success, or an error code otherwise.
-// On success, *assigned_pocket (if non-NULL) is set to the pocket number assigned.
-carousel_op_result_t tooltable_carousel_add (tool_id_t tool_id, uint16_t max_pockets, const char *name, pocket_id_t *assigned_pocket);
-
-// Remove a tool from the carousel (clears pocket_id only — offsets persist)
-// and persists the change to the tooltable file.
-// Returns CarouselOp_OK on success, or an error code otherwise.
-carousel_op_result_t tooltable_carousel_remove (tool_id_t tool_id);
-
-// Delete a P0 tool entry from the tooltable entirely.
-// Only tools with no carousel pocket assignment may be deleted — returns
-// CarouselOp_ToolAlreadyInPocket if the tool is currently in a pocket.
-// Returns CarouselOp_OK on success, or an error code otherwise.
-carousel_op_result_t tooltable_delete (tool_id_t tool_id);
-/* ---- end tooltable.h ---- */
+#include "tooltable.h"
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -119,7 +54,6 @@ static char              filename[]   = "/tooltable.tbl";
 static uint16_t    max_pockets = 0;   // set by ATC plugin via tooltable_set_max_pockets()
 
 // Zeroed fallback pocket — always valid, used before FS mounts or on empty table.
-// Mirrors the pocket0 pattern from the TOOLTABLE_ENABLE==1 implementation.
 static tool_pocket_t     pocket0      = {0};
 
 static tool_select_ptr       tool_select;
@@ -276,8 +210,6 @@ static bool parse_line (char *line, tool_pocket_t *out)
 
 // ---------------------------------------------------------------------------
 // File scan — find a tool entry by tool_id.
-// Scans the file linearly. Returns true and populates *out if found.
-// Pass NULL for out if you only need to test existence.
 // ---------------------------------------------------------------------------
 static bool file_find (tool_id_t tool_id, tool_pocket_t *out)
 {
@@ -299,35 +231,17 @@ static bool file_find (tool_id_t tool_id, tool_pocket_t *out)
     }
 
     vfs_close(file);
-/*
-    char buf[120];
-    if(found)
-        sprintf(buf, "[file_find: T%ld P%d X%.3f Y%.3f Z%.3f D%.3f]\n",
-                (long)tool_id,
-                (int)(out ? out->pocket_id : entry.pocket_id),
-                entry.tool.offset.values[X_AXIS],
-                entry.tool.offset.values[Y_AXIS],
-                entry.tool.offset.values[Z_AXIS],
-                entry.tool.radius * 2.0f);
-    else
-        sprintf(buf, "[file_find: T%ld not found]\n", (long)tool_id);
-    hal.stream.write(buf);
-*/
     return found;
 }
 
 // ---------------------------------------------------------------------------
 // File scan — find the lowest free carousel pocket number.
-// Scans the file to build a used-pocket bitmap, then returns the lowest
-// pocket number from 1 to max_pockets not currently assigned.
 // ---------------------------------------------------------------------------
 static pocket_id_t file_find_free_pocket (uint16_t max_pockets)
 {
     if(max_pockets == 0)
         return -1;
 
-    // Use a simple boolean array on the stack — max_pockets is at most a few hundred.
-    // 500 pockets = 500 bytes stack, acceptable.
     bool in_use[max_pockets + 1];
     memset(in_use, 0, sizeof(in_use));
 
@@ -350,7 +264,6 @@ static pocket_id_t file_find_free_pocket (uint16_t max_pockets)
 
     return -1;
 }
-
 
 // ---------------------------------------------------------------------------
 // Write one pocket entry as a line to an open file.
@@ -384,19 +297,15 @@ static void write_pocket_line (vfs_file_t *file, const tool_pocket_t *p)
 }
 
 // ---------------------------------------------------------------------------
-// Rewrite the entire file, optionally overriding pocket_ids for specific
-// tools.  Uses a temp file to avoid any heap allocation — one line at a
-// time is read from the source, modified if it matches an override, and
-// written to the temp file.  The temp file is then renamed over the original.
-// Stack usage: one line buffer (300 bytes) + one tool_pocket_t (~200 bytes).
+// Rewrite the entire file, optionally overriding pocket_ids for specific tools.
 // ---------------------------------------------------------------------------
 #define MAX_OVERRIDES 2
 
 typedef struct {
     tool_id_t   tool_id;
     pocket_id_t new_pocket_id;
-    char        name[sizeof(((tool_pocket_t*)0)->name)];  // optional: empty = no change
-    bool        delete_entry;                              // if true, omit this tool from rewritten file
+    char        name[sizeof(((tool_pocket_t*)0)->name)];
+    bool        delete_entry;
 } pocket_override_t;
 
 static char filename_tmp[] = "/tooltable.tmp";
@@ -419,12 +328,9 @@ static bool rewrite_file (const pocket_override_t *overrides, uint8_t n_override
     while(read_line(src, line, sizeof(line))) {
 
         if(!parse_line(line, &entry)) {
-            // Blank or comment line — skip (do not carry forward comments
-            // since the first-pass counter bug is gone and we never write them)
             continue;
         }
 
-        // Check if this tool has a pocket_id or name override
         bool skip = false;
         for(uint8_t oi = 0; oi < n_overrides; oi++) {
             if(entry.tool.tool_id == overrides[oi].tool_id) {
@@ -446,7 +352,6 @@ static bool rewrite_file (const pocket_override_t *overrides, uint8_t n_override
     vfs_close(src);
     vfs_close(dst);
 
-    // FAT filesystems cannot rename over an existing file — delete first.
     vfs_unlink(filename);
     if(vfs_rename(filename_tmp, filename) != 0) {
         vfs_unlink(filename_tmp);
@@ -458,7 +363,6 @@ static bool rewrite_file (const pocket_override_t *overrides, uint8_t n_override
 
 // ---------------------------------------------------------------------------
 // Append a brand-new tool entry to the end of the file.
-// Avoids a full read-modify-write for the common $TCADD new-tool case.
 // ---------------------------------------------------------------------------
 static bool append_tool (const tool_pocket_t *p)
 {
@@ -495,7 +399,7 @@ static bool append_tool (const tool_pocket_t *p)
     return true;
 }
 
-#define TOOL_CACHE_SIZE 4  // current, pending, and a couple of spares
+#define TOOL_CACHE_SIZE 4
 
 static tool_table_entry_t cache_result[TOOL_CACHE_SIZE]  = {0};
 static tool_pocket_t      cache_entry[TOOL_CACHE_SIZE]   = {0};
@@ -503,13 +407,10 @@ static tool_data_t        cache_unknown[TOOL_CACHE_SIZE] = {0};
 
 static tool_table_entry_t *getTool (tool_id_t tool_id)
 {
-    // Find existing slot for this tool_id, or evict the oldest
     static uint8_t next_slot = 0;
     int slot = -1;
 
-    // Check pending deferred write first — most up-to-date offset
     if(pending_set_tool_valid && pending_set_tool.tool_id == tool_id) {
-        // Use slot 0 for pending tool — stable pointer
         slot = 0;
         cache_result[slot] = (tool_table_entry_t){0};
         cache_entry[slot].tool    = pending_set_tool;
@@ -521,7 +422,6 @@ static tool_table_entry_t *getTool (tool_id_t tool_id)
         return &cache_result[slot];
     }
 
-    // First check if this tool_id is already cached
     for(int i = 0; i < TOOL_CACHE_SIZE; i++) {
         if(cache_result[i].data && cache_result[i].data->tool_id == tool_id) {
             slot = i;
@@ -529,16 +429,14 @@ static tool_table_entry_t *getTool (tool_id_t tool_id)
         }
     }
 
-    // Not found — evict next slot in round-robin order, but never evict
-    // the slot currently backing gc_state.tool
     if(slot == -1) {
         uint8_t attempts = 0;
         do {
             slot = next_slot;
             next_slot = (next_slot + 1) % TOOL_CACHE_SIZE;
             attempts++;
-        } while(attempts < TOOL_CACHE_SIZE && 
-                gc_state.tool && 
+        } while(attempts < TOOL_CACHE_SIZE &&
+                gc_state.tool &&
                 cache_entry[slot].tool.tool_id == gc_state.tool->tool_id);
     }
 
@@ -557,7 +455,7 @@ static tool_table_entry_t *getTool (tool_id_t tool_id)
         cache_result[slot].pocket = pocket0.pocket_id;
         cache_result[slot].name   = pocket0.name;
         return &cache_result[slot];
-    }   
+    }
 
     cache_unknown[slot] = (tool_data_t){0};
     cache_unknown[slot].tool_id = tool_id;
@@ -567,10 +465,6 @@ static tool_table_entry_t *getTool (tool_id_t tool_id)
     return &cache_result[slot];
 }
 
-// ---------------------------------------------------------------------------
-// grbl.tool_table.get_tool_by_idx - look up tool by pocket number.
-// Scans the file for the tool assigned to the given pocket (1-based index).
-// ---------------------------------------------------------------------------
 static tool_table_entry_t *getToolByIdx (uint32_t idx)
 {
     static tool_table_entry_t result = {0};
@@ -611,7 +505,6 @@ static tool_table_entry_t *getToolByIdx (uint32_t idx)
     return &result;
 }
 
-//deferred set tool.
 static bool set_tool_write (tool_data_t *tool_data)
 {
     tool_id_t tool_id = tool_data->tool_id;
@@ -666,7 +559,6 @@ static void deferred_set_tool (void)
             newentry.pocket_id = 0;
             append_tool(&newentry);
         }
-        // Clear after write so subsequent getTool calls read from file
         pending_set_tool_valid = false;
         memset(&pending_set_tool, 0, sizeof(pending_set_tool));
     }
@@ -675,14 +567,12 @@ static void deferred_set_tool (void)
         grbl.on_macro_return();
 }
 
-
 static bool setTool (tool_data_t *tool_data)
 {
     if(!tool_data || tool_data->tool_id <= 0)
         return false;
 
     if(hal.stream.file != NULL) {
-        // Macro is running — defer the write, serve from pending until written
         pending_set_tool       = *tool_data;
         pending_set_tool_valid = true;
         on_set_return          = grbl.on_macro_return;
@@ -693,10 +583,6 @@ static bool setTool (tool_data_t *tool_data)
     return set_tool_write(tool_data);
 }
 
-// ---------------------------------------------------------------------------
-// grbl.tool_table.clear - zero offsets for all tools (tools remain in table).
-// Rewrites the file with all offsets zeroed.
-// ---------------------------------------------------------------------------
 static bool clearTools (void)
 {
     if(!fs_available)
@@ -735,9 +621,6 @@ static bool clearTools (void)
     return true;
 }
 
-// Return the name/comment for a tool by scanning the file.
-// Returns NULL if the tool is not found or has no name.
-// Uses a static buffer — safe for single-call use (e.g. operator notification).
 const char *tooltable_get_name (tool_id_t tool_id)
 {
     static tool_pocket_t entry;
@@ -746,10 +629,6 @@ const char *tooltable_get_name (tool_id_t tool_id)
     return entry.name;
 }
 
-// Register a tool in the tooltable at P0 (not in the carousel).
-// If the tool already exists its name is updated if name is non-NULL and non-empty.
-// Returns CarouselOp_ToolAlreadyInPocket if the tool already has a pocket assigned —
-// use $TCADD to move an existing P0 tool into the carousel instead.
 carousel_op_result_t tooltable_register_tool (tool_id_t tool_id, const char *name)
 {
     if(!fs_available)
@@ -759,7 +638,6 @@ carousel_op_result_t tooltable_register_tool (tool_id_t tool_id, const char *nam
     bool found = file_find(tool_id, &existing);
 
     if(found) {
-        // Tool already exists — update name if one was provided, preserve pocket
         if(name && *name) {
             pocket_override_t ov = {0};
             ov.tool_id       = tool_id;
@@ -770,11 +648,9 @@ carousel_op_result_t tooltable_register_tool (tool_id_t tool_id, const char *nam
                 return CarouselOp_WriteError;
             return CarouselOp_OK;
         }
-        // Tool already registered, no name provided — nothing to do
         return CarouselOp_AlreadyRegistered;
     }
 
-    // Brand-new tool — append as P0
     tool_pocket_t newentry = {0};
     newentry.tool.tool_id = tool_id;
     newentry.pocket_id    = 0;
@@ -787,10 +663,6 @@ carousel_op_result_t tooltable_register_tool (tool_id_t tool_id, const char *nam
 
     return CarouselOp_OK;
 }
-
-// ---------------------------------------------------------------------------
-// Public carousel API
-// ---------------------------------------------------------------------------
 
 carousel_op_result_t tooltable_carousel_add (tool_id_t tool_id, uint16_t max_pockets, const char *name, pocket_id_t *assigned_pocket)
 {
@@ -808,7 +680,6 @@ carousel_op_result_t tooltable_carousel_add (tool_id_t tool_id, uint16_t max_poc
         return CarouselOp_NoPocketAvailable;
 
     if(found) {
-        // Tool exists as P0 in file — update pocket and optionally name via rewrite
         pocket_override_t ov = {0};
         ov.tool_id       = tool_id;
         ov.new_pocket_id = free_pocket;
@@ -819,7 +690,6 @@ carousel_op_result_t tooltable_carousel_add (tool_id_t tool_id, uint16_t max_poc
         if(!rewrite_file(&ov, 1))
             return CarouselOp_WriteError;
     } else {
-        // Brand-new tool — append entry with optional name
         tool_pocket_t newentry = {0};
         newentry.tool.tool_id = tool_id;
         newentry.pocket_id    = free_pocket;
@@ -837,7 +707,6 @@ carousel_op_result_t tooltable_carousel_add (tool_id_t tool_id, uint16_t max_poc
     return CarouselOp_OK;
 }
 
-
 carousel_op_result_t tooltable_carousel_remove (tool_id_t tool_id)
 {
     if(!fs_available)
@@ -854,13 +723,6 @@ carousel_op_result_t tooltable_carousel_remove (tool_id_t tool_id)
     return CarouselOp_OK;
 }
 
-// ---------------------------------------------------------------------------
-// tooltable_delete() — Remove a P0 tool entry from the tooltable entirely.
-//
-// Only tools with no carousel pocket assignment (P0) may be deleted.  If the
-// tool is currently assigned to a pocket, returns CarouselOp_ToolAlreadyInPocket
-// so the caller can report a clear error without touching the file.
-// ---------------------------------------------------------------------------
 carousel_op_result_t tooltable_delete (tool_id_t tool_id)
 {
     if(!fs_available)
@@ -881,9 +743,7 @@ carousel_op_result_t tooltable_delete (tool_id_t tool_id)
 }
 
 // ---------------------------------------------------------------------------
-// onToolChanged - called after M6/M61 completes.
-// Registers new tools automatically and updates current_tool.
-// Pocket assignments are permanent — managed explicitly via $TCADD/$TCRM.
+// onToolChanged
 // ---------------------------------------------------------------------------
 static tool_id_t pending_register_tool = 0;
 static on_macro_return_ptr on_changed_return   = NULL;
@@ -923,54 +783,43 @@ static void onToolChanged (tool_data_t *tool)
 
 static void onToolSelect (tool_data_t *tool, bool next)
 {
-    //char buf[128];
-    //sprintf(buf, "[onToolSelect: tool_id=%u next=%d current_tool=%u gc_state.tool=%u]" ASCII_EOL,
-    //tool->tool_id, next, current_tool, gc_state.tool ? gc_state.tool->tool_id : 0);
-    //hal.stream.write(buf);
- 
     if(!next) {
         current_tool = tool->tool_id;
-        ngc_param_set(4904, 1.0f);      // M61 signal: not a real Txx
+        ngc_param_set(4904, 1.0f);
     }
- 
+
     if(next && max_pockets > 0) {
-        // Use grblHAL's current tool data directly — reliable on boot
-        // since grblHAL restores it from persistent storage before we run
         tool_id_t outgoing_id = gc_state.tool ? gc_state.tool->tool_id : 0;
- 
-        // Look up outgoing pocket directly from file — permanent assignment
+
         tool_pocket_t outgoing;
         pocket_id_t outgoing_pocket = -1;
         if(outgoing_id > 0 && file_find(outgoing_id, &outgoing) && outgoing.pocket_id >= 1)
             outgoing_pocket = outgoing.pocket_id;
- 
-        // Look up incoming pocket directly from file
+
         tool_pocket_t incoming;
         pocket_id_t incoming_pocket = -1;
         if(file_find(tool->tool_id, &incoming) && incoming.pocket_id >= 1)
             incoming_pocket = incoming.pocket_id;
- 
-        // Report incoming tool ID and name to operator
+
         char buf[80];
         if(incoming.name[0] != '\0')
             snprintf(buf, sizeof(buf), "T%ld: %s" ASCII_EOL, (long)tool->tool_id, incoming.name);
         else
             snprintf(buf, sizeof(buf), "T%ld" ASCII_EOL, (long)tool->tool_id);
         report_message(buf, Message_Info);
- 
+
         ngc_param_set(4900, (float)outgoing_id);
         ngc_param_set(4901, (float)outgoing_pocket);
         ngc_param_set(4902, (float)tool->tool_id);
         ngc_param_set(4903, (float)incoming_pocket);
-        ngc_param_set(4904, 0.0f);      // signal: real Txx pre-selection
+        ngc_param_set(4904, 0.0f);
     }
- 
+
     if(tool_select)
         tool_select(tool, next);
 }
 
-// $TTLIST - print tool table to console directly from file.
-// ---------------------------------------------------------------------------
+// $TTLIST
 static status_code_t list_tools (sys_state_t state, char *args)
 {
     hal.stream.write("[TOOLTABLE: P=pocket T=tool offsets diameter name]" ASCII_EOL);
@@ -1027,9 +876,7 @@ static status_code_t list_tools (sys_state_t state, char *args)
     return Status_OK;
 }
 
-// ---------------------------------------------------------------------------
-// $TTLOAD - verify tooltable file is accessible
-// ---------------------------------------------------------------------------
+// $TTLOAD
 static status_code_t load_tools (sys_state_t state, char *args)
 {
     if(!fs_available)
@@ -1049,9 +896,6 @@ static status_code_t reload_tools (void)
     return load_tools(state_get(), NULL);
 }
 
-// ---------------------------------------------------------------------------
-// File management
-// ---------------------------------------------------------------------------
 static void ensure_tooltable_exists (void)
 {
     vfs_file_t *file = vfs_open(filename, "r");
@@ -1078,9 +922,6 @@ static void loadTools (const char *path, const vfs_t *fs, vfs_st_mode_t mode)
         on_vfs_mount(path, fs, mode);
 }
 
-// ---------------------------------------------------------------------------
-// Report
-// ---------------------------------------------------------------------------
 static void onReportOptions (bool newopt)
 {
     on_report_options(newopt);
@@ -1088,8 +929,7 @@ static void onReportOptions (bool newopt)
         report_plugin("Tool table", "0.04");
 }
 
-// $TTREG=Tn [,name] — Register a tool in the tooltable at P0.
-// ---------------------------------------------------------------------------
+// $TTREG=Tn [,name]
 static status_code_t register_tool (sys_state_t state, char *args)
 {
     if(state_get() != STATE_IDLE) {
@@ -1151,8 +991,7 @@ static status_code_t register_tool (sys_state_t state, char *args)
     }
 }
 
-// $TTDEL=Tn — Delete a P0 tool entry from the tooltable entirely.
-// ---------------------------------------------------------------------------
+// $TTDEL=Tn
 static status_code_t delete_tool (sys_state_t state, char *args)
 {
     if(state_get() != STATE_IDLE) {
@@ -1206,9 +1045,7 @@ static status_code_t delete_tool (sys_state_t state, char *args)
     }
 }
 
-// $TTCLR [Tn] — Clear the length offset for a tool in the tooltable.
-// If no tool number is given, clears the offset for the current spindle tool.
-// ---------------------------------------------------------------------------
+// $TTCLR [Tn]
 static status_code_t clear_tool_offset (sys_state_t state, char *args)
 {
     if(state_get() != STATE_IDLE) {
@@ -1287,13 +1124,10 @@ void tooltable_init (void)
     on_report_options = grbl.on_report_options;
     grbl.on_report_options = onReportOptions;
 
-    // Initialise pocket0 as a safe zeroed fallback — tool_id=0, all offsets=0.
-    // This mirrors the TOOLTABLE_ENABLE==1 pattern so getTool/getToolByIdx
-    // always return valid data even before the VFS mounts or if the table is empty.
     memset(&pocket0, 0, sizeof(tool_pocket_t));
     pocket0.tool.tool_id = 0;
     pocket0.pocket_id    = -1;
-    
+
     grbl.tool_table.n_tools         = 1;
     grbl.tool_table.get_tool        = getTool;
     grbl.tool_table.reload          = reload_tools;
@@ -1305,7 +1139,6 @@ void tooltable_init (void)
 
     settings.macro_atc_flags.random_toolchanger = 1;
 
-    // Seed current_tool from grblHAL's persisted spindle tool on boot
     current_tool = gc_state.tool ? gc_state.tool->tool_id : 0;
 
 #if SDCARD_ENABLE

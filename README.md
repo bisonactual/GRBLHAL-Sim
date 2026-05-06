@@ -1,112 +1,137 @@
-This simulator is built for the rapid development of [Flexisender](https://github.com/bisonactual/Flexisender2). You can use it alongside flexisender to run a simulated env. stdin is available, so you can simulate physical triggers which show up in Flexisender. You can also use it to test any other sender. 
-
-Connection is only over websocket. Web stack is not simulated, it's just existent to connect.
-
-Currently has a hard build of the dev branch atc plugin from expatria included. You can rapidly add and test your small plugins by pushing them to the rapid plugin builder - it recompiles to add your plugin on the fly. I use this on WSL in windows, but it should work on windows/linux. Give it to a clanker and it'll sort out minor issues. 
-
-SD Card is mounted in /build/sdcard and provides 1gb for various shenanigans. EEPROM is where the 'hardware memory' lives. 
-
-Clanker output below :)
-
 # grblHAL FlexiHAL Simulator
 
-A cross-platform simulator for CNC controllers running [grblHAL](https://github.com/grblHAL) firmware. Compiles the real grblHAL core with a virtual HAL driver that emulates the [Expatria FlexiHAL](https://github.com/Expatria-Technologies/Flexi-HAL) controller.
+A cross-platform simulator for the FlexiHAL grblHAL controller profile used by Expatria. It compiles the real grblHAL core with a virtual HAL driver and exposes the controller to G-code senders over WebSocket.
 
-Connect any G-code sender via WebSocket. Upload firmware via drag-and-drop UF2. Add grblHAL plugins through a browser UI.
+This is a fixed simulator build, not a runtime firmware uploader. The bundled profile currently targets an Expatria Flexi-HAL style STM32F446 controller with 5 axes, PWM spindle, flood/mist coolant, probe, safety door, E-stop, simulated EEPROM, simulated SD card, and the active bundled simulation plugins: Sienci ATCi and Exclusion Zones.
 
-## What it does
+It is used for Flexisender development, but it can also be used with other WebSocket-capable G-code senders.
 
-- Runs the **real grblHAL C code** on your PC — not an emulation, the actual motion planner, G-code parser, and state machine
-- Emulates a FlexiHAL board: 5 axes (X/Y/Z + 2 ABC), PWM spindle, flood/mist coolant, probe, safety door, E-stop
-- **WebSocket server** so any sender (CNCjs, UGS, gSender, etc.) can connect
-- **UF2 firmware upload** via browser drag-and-drop
-- **Plugin manager** — drop in grblHAL plugin `.c` files, rebuild from the browser
-- Board-specific guards are automatically stripped so plugins work in simulation
-- Persistent settings via EEPROM file
-- Keyboard-driven hardware event simulation (limits, probe, e-stop, etc.)
+## What It Does
 
-## Quick start
+- Runs the real grblHAL parser, planner, state machine, settings, alarms, and reports on a PC.
+- Emulates the FlexiHAL hardware surface used by the current simulator profile.
+- Lets senders such as gSender, CNCjs, and UGS connect to `ws://localhost:8080`.
+- Keeps simulator controls local through stdin, so the sender WebSocket remains sender-only.
+- Persists settings in an EEPROM file.
+- Provides a host-backed `sdcard/` folder for grblHAL VFS and tool table style workflows.
+- Includes a native Windows launcher for start/stop, port settings, persisted options, controller-state display, log viewing, and simulator input buttons.
 
-### Prerequisites
+## Quick Start
 
-**Linux / WSL (Ubuntu):**
+### Linux
+
+Install dependencies:
+
 ```bash
 sudo apt-get install build-essential cmake git
 ```
 
-**Windows (native):**
-- [Git](https://git-scm.com/download/win)
-- [CMake](https://cmake.org/download/) (add to PATH during install)
-- [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/downloads/) — select "Desktop development with C++"
-
-### Clone & build
+Build and run:
 
 ```bash
-git clone --recurse-submodules https://github.com/Expatria-Technologies/grblhal-sim.git
-cd grblhal-sim
-mkdir build && cd build
-cmake ..
-make        # Linux/WSL
-# or: cmake --build . --config Release    # Windows
+git clone --recurse-submodules https://github.com/bisonactual/GRBLHAL-Sim.git
+cd GRBLHAL-Sim
+cmake -S . -B build-release/linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release/linux -j
+./build-release/linux/grblHAL_flexihal_sim
 ```
 
-### Run
+Create a Linux release tarball:
+
+```bash
+./packaging/linux/package-linux.sh
+```
+
+The archive is written to `dist/grblhal-flexihal-sim-linux-x64.tar.gz`.
+
+### Windows
+
+Install:
+
+- Git
+- CMake
+- Visual Studio Build Tools 2022 with "Desktop development with C++"
+
+From an x64 Native Tools Command Prompt:
+
+```bat
+git clone --recurse-submodules https://github.com/bisonactual/GRBLHAL-Sim.git
+cd GRBLHAL-Sim
+cmake -S . -B C:\Users\Owl\git\grblhal-sim-windows-build -G "Visual Studio 17 2022" -A x64 -DBUILD_WINDOWS_LAUNCHER=ON
+cmake --build C:\Users\Owl\git\grblhal-sim-windows-build --config Release
+```
+
+Create a Windows release zip:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\windows\package-windows.ps1
+```
+
+The archive is written to `dist/grblhal-flexihal-sim-windows-x64.zip`.
+
+### macOS
+
+Install:
+
+- Xcode Command Line Tools
+- CMake
+- Git
+
+Build and run:
+
+```bash
+git clone --recurse-submodules https://github.com/bisonactual/GRBLHAL-Sim.git
+cd GRBLHAL-Sim
+cmake -S . -B build-release/macos -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release/macos -j
+./build-release/macos/grblHAL_flexihal_sim
+```
+
+Create a macOS release tarball:
+
+```bash
+./packaging/macos/package-macos.sh
+```
+
+The archive is written to `dist/grblhal-flexihal-sim-macos-<arch>.tar.gz`.
+
+## Running
+
+CLI:
 
 ```bash
 ./grblHAL_flexihal_sim
 ```
 
-You'll see:
-```
-=== grblHAL FlexiHAL Simulator ===
-Emulating: Expatria Flexi-HAL (STM32F446)
-Axes: 5 (X, Y, Z + 2 ABC motors)
+Windows launcher:
 
-[WS] Listening on ws://0.0.0.0:8080
-[HTTP] Management page at http://localhost:8081
-
-Ready. Connect your sender to ws://localhost:8080
-Manage firmware & plugins at http://localhost:8081
+```text
+grblHAL_flexihal_launcher.exe
 ```
 
-### Connect your sender
+The launcher starts and stops the simulator process, stores its settings in `%LOCALAPPDATA%\grblHAL FlexiHAL Simulator\launcher.ini`, shows simulator output, and sends simulator input commands to the child process over stdin.
+It also polls the simulator over stdin for a stdout `[SIMSTATE]` line and displays the current grblHAL realtime state without using the sender WebSocket.
 
-Point your sender's connection to:
-```
+Connect your sender to:
+
+```text
 ws://localhost:8080
 ```
 
-### Upload firmware
+## Command-Line Options
 
-Open `http://localhost:8081` in your browser. Drag a `.uf2` file onto the Firmware tab.
-
-FlexiHAL firmware can be built from: https://github.com/Expatria-Technologies/STM32F4xx (branch `F446_Flexi_HAL`)
-
-Or download pre-built `.uf2` files from the [FlexiHAL releases](https://github.com/Expatria-Technologies/Flexi-HAL/releases).
-
-### Add plugins
-
-1. Open `http://localhost:8081` and click the **Plugins** tab
-2. Drag in a grblHAL plugin `.c` file
-3. Click **Rebuild & Restart Simulator**
-4. Restart the simulator to load the new plugin
-
-Board-specific `#if defined(BOARD_XXX)` guards are automatically removed so plugins compile for the simulator. Hardware I/O calls (`DIGITAL_IN`, `AUXINPUT` ports, etc.) are stubbed to safe defaults.
-
-## Command-line options
-
-```
--w <port>   WebSocket port (default: 8080)
--u <port>   HTTP management port (default: 8081)
+```text
+-w <port>   WebSocket port for sender connection (default: 8080)
 -t <speed>  Realtime speed multiplier (default: 1.0, 0 = max speed)
--e <file>   EEPROM settings file (default: EEPROM.DAT)
+-e <file>   EEPROM/settings file (default: EEPROM.DAT)
 -r <time>   Step report interval in seconds (0 = off)
 -n          No comment prefix on serial output
+-h          Show help
 ```
 
-## Keyboard controls
+## Simulator Inputs
 
-When a sender is connected via WebSocket, stdin is free for hardware simulation:
+When running from a terminal, press keys in the simulator console. When using the Windows launcher, use either the buttons or the same keys while the launcher window has focus.
 
 | Key | Action |
 |-----|--------|
@@ -118,41 +143,65 @@ When a sender is connected via WebSocket, stdin is free for hardware simulation:
 | `p` | Toggle Probe |
 | `o` | Toggle Probe Connected |
 | `x` `y` `z` | Toggle axis limit switches |
+| `1` | Inject hard limit alarm (`ALARM:1`) |
+| `2` | Inject soft limit alarm (`ALARM:2`) |
+| `3` | Inject abort during cycle alarm (`ALARM:3`) |
+| `4` | Inject probe initial-state alarm (`ALARM:4`) |
+| `5` | Inject probe contact alarm (`ALARM:5`) |
+| `6` | Inject homing reset alarm (`ALARM:6`) |
+| `7` | Inject homing door alarm (`ALARM:7`) |
+| `8` | Inject homing pull-off alarm (`ALARM:8`) |
+| `9` | Inject homing approach alarm (`ALARM:9`) |
+| `0` | Inject E-stop asserted alarm (`ALARM:10`) |
+| `m` | Inject motor fault alarm (`ALARM:17`) |
+| `i` | Force the simulator controller state back to Idle |
+| `n` | Toggle no-response mode: keep WebSocket connected but drop controller replies |
+| `k` | Kick the active WebSocket client |
 | `?` | Request status report |
-| Ctrl+C | Stop simulator |
+| Ctrl+C | Stop simulator in a terminal |
 
-## Building with plugins via cmake
+The Windows launcher also uses simulator-private stdin byte `0x12` to request a stdout state line:
 
-Instead of the web UI, you can enable plugins at build time:
-
-```bash
-cmake .. -DPLUGIN_EXCLUSION_ZONES=ON
-make
+```text
+[SIMSTATE]<Idle|MPos:0.000,0.000,0.000,0.000,0.000|...>
 ```
 
-## Project structure
+That line is for local UI/status tooling. It is not sent over the sender WebSocket.
+Forcing Idle prints a normal simulator log line and then emits a fresh `[SIMSTATE]` line so local UI can update immediately.
 
-```
+## Project Structure
+
+```text
 grblhal-sim/
 ├── CMakeLists.txt
+├── packaging/
+│   ├── linux/package-linux.sh
+│   ├── macos/package-macos.sh
+│   └── windows/package-windows.ps1
+├── plugins/                 # Bundled simulator profile plugins
 ├── src/
-│   ├── grbl/               # grblHAL core (git submodule)
-│   ├── driver.c/h          # FlexiHAL virtual HAL driver
-│   ├── main.c              # Entry point, WebSocket + HTTP setup
-│   ├── simulator.c/h       # Simulation tick engine
-│   ├── mcu.c/h             # Virtual MCU (timers, GPIO, UART)
-│   ├── serial.c/h          # UART ring buffer emulation
-│   ├── eeprom.c/h          # NVS persistence to file
-│   ├── websocket.c/h       # RFC 6455 WebSocket server
-│   ├── uf2.c/h             # UF2 parser + plugin manager + HTTP UI
-│   ├── sim_stubs.h         # Hardware macro stubs for plugins
-│   ├── my_plugin.c         # Auto-generated plugin loader
-│   └── platform_*.c/h      # OS abstraction (Linux/Windows)
-└── plugins/                 # Drop plugin .c files here (auto-discovered)
+│   ├── grbl/                # grblHAL core submodule
+│   ├── driver.c/h           # FlexiHAL virtual HAL driver
+│   ├── main.c               # Simulator entry point
+│   ├── websocket.c/h        # Sender WebSocket server
+│   ├── fs_sim.c/h           # Host-backed simulated SD card
+│   ├── eeprom.c/h           # NVS persistence to file
+│   ├── my_plugin.c          # Bundled plugin entry points
+│   └── platform_*.c/h       # OS abstraction
+└── ui/windows-launcher/      # Native Windows launcher
 ```
+
+## Notes
+
+- The sender WebSocket is only for sender/controller traffic.
+- Simulator hardware events are injected through stdin.
+- The upstream grblHAL core is kept as a clean submodule; simulator compatibility changes are applied from `packaging/grbl-core-flexihal-sim.patch` into the build tree.
+- GitHub Actions builds Linux, Windows, and macOS packages on pushes, pull requests, and tags.
+- Runtime UF2 firmware upload and browser plugin rebuilds were removed because this distributable targets one known FlexiHAL profile.
+- Future firmware-profile loading should be added as a separate explicit simulator feature, not as source upload and rebuild from the browser.
 
 ## License
 
-GPLv3 — same as grblHAL.
+GPLv3, same as grblHAL.
 
-Based on the [grblHAL Simulator](https://github.com/grblHAL/Simulator) by Terje Io, Jens Geisler, and Adam Shelly.
+Based on the grblHAL Simulator by Terje Io, Jens Geisler, and Adam Shelly.

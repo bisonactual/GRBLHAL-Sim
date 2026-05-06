@@ -16,16 +16,8 @@
 #include "grbl/plugins.h"
 #include "grbl/task.h"
 
-/*
-   TOLERANCE BUFFER
-   We only flag the tool as "Trapped" (blocking ALL movement) if it is deeper
-   than this value inside the zone.
-*/
 #define KEEPOUT_TOLERANCE 0.5f
 
-/*
-   Exact Message Strings needed by UI
-*/
 #define MSG_INSIDE_ZONE "ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety"
 #define MSG_BLOCKED_AT_WALL "ATCI: Jog move blocked at keepout boundary."
 #define MSG_CROSSING "ATCI: Move crosses keepout zone"
@@ -85,29 +77,23 @@ static void onReportOptions (bool newopt);
 static void onRealtimeReport (stream_write_ptr stream_write, report_tracking_flags_t report);
 static void onReportNgcParameters (void);
 
-/* Additional sensor states and inside zone marker */
 static bool drawbar_state = false;
 static bool tool_sensor_state = false;
 static bool pressure_sensor_state = false;
 static bool inside_keepout_zone = false;
 
-/* Function pointer backups */
 typedef bool (*travel_limits_ptr)(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope);
 typedef void (*apply_travel_limits_ptr)(float *target, float *position, work_envelope_t *envelope);
 
 static travel_limits_ptr prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 
-/* Setting IDs - choose a free range if you have other plugins */
 #define SETTING_PLUGIN_ENABLE         683
 #define SETTING_X_MIN                 684
 #define SETTING_Y_MIN                 685
 #define SETTING_X_MAX                 686
 #define SETTING_Y_MAX                 687
 
-/* --- Helpers --- */
-
-/* Build runtime cached min/max and mirror flags from persistent config */
 static void keepout_set(void)
 {
     atci.x_min = fminf(config.x_min, config.x_max);
@@ -116,8 +102,6 @@ static void keepout_set(void)
     atci.y_max = fmaxf(config.y_min, config.y_max);
 }
 
-/* is the keepout enforcement currently active?
-   requires both the plugin to be persistently enabled and the runtime keepout flag */
 static bool is_keepout_active(void)
 {
     return (config.flags.plugin_enabled && atci.enabled);
@@ -131,12 +115,11 @@ static void set_keepout_state(bool new_state, keepout_source_t event_source)
     }
 }
 
-/* --- Tool change & rack monitoring --- */
 static void keepout_tool_selected(tool_data_t *tool)
 {
     if (config.flags.monitor_tc_macro) {
         tc_macro_running = true;
-        set_keepout_state(false, SOURCE_MACRO); /* during TC macro disable keepout */
+        set_keepout_state(false, SOURCE_MACRO);
     }
     if (prev_on_tool_selected)
         prev_on_tool_selected(tool);
@@ -153,7 +136,6 @@ static void keepout_tool_changed(tool_data_t *tool)
         prev_on_tool_changed(tool);
 }
 
-/* --- Sensor polling with inside zone tracking --- */
 static void poll_rack_sensor (void *data)
 {
     task_add_delayed(poll_rack_sensor, NULL, 100);
@@ -166,17 +148,10 @@ static void poll_rack_sensor (void *data)
         }
     }
 
-    /* Additional sensors (optional) */
     drawbar_state         = !DIGITAL_IN(AUXINPUT0_PORT, AUXINPUT0_PIN);
     tool_sensor_state     = !DIGITAL_IN(AUXINPUT1_PORT, AUXINPUT1_PIN);
     pressure_sensor_state = !DIGITAL_IN(AUXINPUT2_PORT, AUXINPUT2_PIN);
 
-    /*
-       Track if we are inside keepout zone (based on planner position).
-       NOTE: For Status Reporting 'Z' flag, we use the EXACT technical definition
-       (including sitting on the line), NOT the tolerance buffer.
-       If you are at Y0.00 and Zone starts at Y0.00, you are IN the zone ('Z').
-    */
     float *pos = plan_get_position();
     if (pos) {
         inside_keepout_zone =
@@ -187,7 +162,6 @@ static void poll_rack_sensor (void *data)
     }
 }
 
-/* --- Geometry --- */
 static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
 {
     float dx = x1 - x0;
@@ -195,8 +169,6 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
     float t0 = 0.0f, t1 = 1.0f;
     float p[4] = { -dx, dx, -dy, dy };
 
-    /* We shrink the mathematical keepout zone by a tiny epsilon
-       so that moves exactly along the boundary are not considered intersecting. */
     float q[4] = {
         x0 - atci.x_min - KEEPOUT_TOLERANCE,
         atci.x_max - x0 - KEEPOUT_TOLERANCE,
@@ -217,11 +189,9 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
             }
         }
     }
-    /* Strict inequality allows touching (t0==t1) without flagging as intersection */
     return t0 < t1;
 }
 
-/* --- Travel & jog protection --- */
 static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope)
 {
     if (!is_keepout_active())
@@ -233,20 +203,14 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     float x0 = pos ? pos[X_AXIS] : 0.0f;
     float y0 = pos ? pos[Y_AXIS] : 0.0f;
 
-    /* We use the Tolerance here so we don't block moves if we are just sitting on the boundary. */
     bool strictly_deep_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) &&
                                  x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
                                  y0 > (atci.y_min + KEEPOUT_TOLERANCE) &&
                                  y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    /*
-       "Technically Inside" check for messaging context.
-       Excludes exact boundary lines so edge cases yield "Blocked" instead of "Stuck".
-    */
     bool technically_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) && x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
                                y0 > (atci.y_min + KEEPOUT_TOLERANCE) && y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    /* Target deep inside check */
     bool target_deep_inside = (xt > (atci.x_min + KEEPOUT_TOLERANCE) &&
                                xt < (atci.x_max - KEEPOUT_TOLERANCE) &&
                                yt > (atci.y_min + KEEPOUT_TOLERANCE) &&
@@ -260,17 +224,11 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
         return false;
     }
 
-    /* Intersection check */
     if (line_intersects_keepout(x0, y0, xt, yt)) {
         if (strictly_deep_inside) {
             report_message(MSG_INSIDE_ZONE, Message_Warning);
             return false;
         }
-        /*
-           Message Priority:
-           If we are technically inside (e.g. on the line) and intersecting (trying to go deeper),
-           report the "Inside Zone" message so the UI shows the helper.
-        */
         else if (technically_inside) {
             report_message(MSG_INSIDE_ZONE, Message_Warning);
             return false;
@@ -284,7 +242,6 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian, envelope) : true;
 }
 
-/* Liang-Barsky style clipping to safe boundary + margin */
 static bool calculate_clipped_point(const float *start, const float *end, float *clipped_point)
 {
     const float x0 = start[X_AXIS];
@@ -311,13 +268,13 @@ static bool calculate_clipped_point(const float *start, const float *end, float 
 
     for (int i = 0; i < 4; i++) {
         if (p[i] == 0) {
-            if (q[i] < 0) return false; /* Parallel and outside, no intersection */
+            if (q[i] < 0) return false;
         } else {
             float t = q[i] / p[i];
-            if (p[i] < 0) { /* Line is entering across this edge */
+            if (p[i] < 0) {
                 if (t > t1) return false;
                 if (t > t0) t0 = t;
-            } else { /* Line is leaving across this edge */
+            } else {
                 if (t < t0) return false;
                 if (t < t1) t1 = t;
             }
@@ -325,7 +282,7 @@ static bool calculate_clipped_point(const float *start, const float *end, float 
     }
 
     if (t0 > 0.0f) {
-        memcpy(clipped_point, end, sizeof(float) * N_AXIS); /* preserve other axes */
+        memcpy(clipped_point, end, sizeof(float) * N_AXIS);
         clipped_point[X_AXIS] = x0 + t0 * dx;
         clipped_point[Y_AXIS] = y0 + t0 * dy;
         return true;
@@ -347,20 +304,17 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
 
-    /* Deep check (Trap prevention using tolerance) */
     bool strictly_deep_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) &&
                                  x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
                                  y0 > (atci.y_min + KEEPOUT_TOLERANCE) &&
                                  y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    /* Technical check (Are we strictly inside geometry?) */
     bool technically_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) && x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
                                y0 > (atci.y_min + KEEPOUT_TOLERANCE) && y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    /* Only block if we are DEEP inside. If on boundary, allow through to intersection check. */
     if (strictly_deep_inside) {
         report_message(MSG_INSIDE_ZONE, Message_Warning);
-        memcpy(target, current_position, sizeof(float) * N_AXIS); /* Block move */
+        memcpy(target, current_position, sizeof(float) * N_AXIS);
         return;
     }
 
@@ -373,21 +327,13 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
     if (target_deep_inside || intersects) {
         float clipped_target[N_AXIS];
         if (calculate_clipped_point(current_position, target, clipped_target)) {
-
-            /* Message Context logic:
-               If we clipped, we blocked a move.
-               If we were already "In" (technically, including edge), say "You are inside" to trigger help.
-               If we were "Out", say "Blocked at boundary".
-            */
             if (technically_inside) {
                 report_message(MSG_INSIDE_ZONE, Message_Warning);
             } else {
                 report_message(MSG_BLOCKED_AT_WALL, Message_Warning);
             }
-
             memcpy(target, clipped_target, sizeof(float) * N_AXIS);
         } else {
-            /* Fallback blocking */
             if (technically_inside) {
                 report_message(MSG_INSIDE_ZONE, Message_Warning);
             } else {
@@ -403,13 +349,9 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
 }
 
 /* --- M960 handlers --- */
-/* M960 toggles runtime-only keepout state (atci.enabled) */
 
 static user_mcode_type_t mcode_check(user_mcode_t mcode)
 {
-    /* Recognize M960 always so it can be used to toggle runtime state,
-       but only advertise as normal if plugin persistent setting is enabled
-       to keep UX similar to original — however we still accept it. */
     if (mcode == 960)
         return UserMCode_Normal;
     return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
@@ -423,7 +365,7 @@ static status_code_t mcode_validate(parser_block_t *gc_block)
         if (gc_block->words.p) {
             if (gc_block->values.p != 0.0f && gc_block->values.p != 1.0f)
                 state = Status_GcodeValueOutOfRange;
-            gc_block->words.p = 0; /* consume */
+            gc_block->words.p = 0;
         }
     }
     return state == Status_Unhandled && user_mcode.validate ? user_mcode.validate(gc_block) : state;
@@ -440,7 +382,6 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
     if (state == STATE_CHECK_MODE)
         return;
 
-    /* Toggle runtime-only keepout state */
     if (gc_block->words.p) {
         set_keepout_state(gc_block->values.p == 1.0f, SOURCE_COMMAND);
     } else {
@@ -448,10 +389,9 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
     }
 }
 
-/* --- Settings registration (persistent only) --- */
+/* --- Settings --- */
 
 static const setting_detail_t plugin_settings[] = {
-    /* persistent flags: plugin_enabled, monitor rack, monitor tc macro */
     { SETTING_PLUGIN_ENABLE,         Group_Limits, "ATCi Plugin",  NULL, Format_XBitfield, "Enable,Monitor Rack Presence,Monitor TC Macro", NULL, NULL, Setting_NonCore, &config.flags.value },
     { SETTING_X_MIN,                 Group_Limits, "ATCi Keepout X Min", "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_NonCore, &config.x_min },
     { SETTING_Y_MIN,                 Group_Limits, "ATCi Keepout Y Min", "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_NonCore, &config.y_min },
@@ -465,7 +405,6 @@ static void atci_save(void)
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
 }
 
-/* --- Restore & load --- */
 static void atci_restore(void)
 {
     config.x_min = 10.0f;
@@ -473,7 +412,6 @@ static void atci_restore(void)
     config.x_max = 50.0f;
     config.y_max = 50.0f;
 
-    /* defaults: plugin persisted OFF (user must enable), monitor flags OFF */
     config.flags.value = 0;
 
     atci.enabled = true;
@@ -493,7 +431,6 @@ static void atci_load(void)
     set_keepout_state(true, SOURCE_STARTUP);
     tc_macro_running = false;
 
-    /* Hook handlers only once */
     if (prev_check_travel_limits == NULL) {
         prev_check_travel_limits = grbl.check_travel_limits;
         grbl.check_travel_limits = travel_limits_check;
@@ -523,7 +460,6 @@ static void atci_load(void)
     }
 }
 
-/* --- Report options & NGC params --- */
 static void onReportOptions(bool newopt)
 {
     if (on_report_options)
@@ -536,7 +472,6 @@ static void onReportNgcParameters(void)
 {
     char buf[100];
 
-    /* Report keepout bounds as part of $# output */
     snprintf(buf, sizeof(buf),
              "[ATCI:%.2f,%.2f,%.2f,%.2f]" ASCII_EOL,
              atci.x_max,
@@ -549,7 +484,6 @@ static void onReportNgcParameters(void)
         on_report_ngc_parameters();
 }
 
-/* --- Realtime report --- */
 static void onRealtimeReport(stream_write_ptr stream_write, report_tracking_flags_t report)
 {
     char buf[20] = "|ATCI:", *flags = strchr(buf, '\0');
@@ -562,7 +496,6 @@ static void onRealtimeReport(stream_write_ptr stream_write, report_tracking_flag
         default: break;
     }
 
-    /* indicate runtime keepout state (enabled/disabled) */
     if (atci.enabled)
         *flags++ = 'E';
 
@@ -601,8 +534,7 @@ void atci_init(void)
     }
 }
 
-/* Bridge function called by flexihal_atc.c to enable/disable keepout
-   during tool change macro execution. */
+/* Bridge function called by flexihal_atc.c */
 void atci_set_keepout_enabled(bool enabled)
 {
     set_keepout_state(enabled, SOURCE_MACRO);

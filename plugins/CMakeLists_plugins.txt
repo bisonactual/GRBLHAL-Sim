@@ -1,6 +1,0 @@
-# Auto-generated plugin list
-set(plugin_SRC
-    ${CMAKE_SOURCE_DIR}/plugins/sienci-atci-plugin.c
-    ${CMAKE_SOURCE_DIR}/plugins/tooltable.c
-    ${CMAKE_SOURCE_DIR}/plugins/exclusion_zones.c
-)

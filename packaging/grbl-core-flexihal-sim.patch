@@ -1,0 +1,282 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1075d5d..034c067 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,7 +12,6 @@ target_sources(grbl INTERFACE
+  ${CMAKE_CURRENT_LIST_DIR}/modbus.c
+  ${CMAKE_CURRENT_LIST_DIR}/modbus_rtu.c
+  ${CMAKE_CURRENT_LIST_DIR}/motion_control.c
+- ${CMAKE_CURRENT_LIST_DIR}/my_plugin.c
+  ${CMAKE_CURRENT_LIST_DIR}/nuts_bolts.c
+  ${CMAKE_CURRENT_LIST_DIR}/override.c
+  ${CMAKE_CURRENT_LIST_DIR}/planner.c
+diff --git a/crossbar.h b/crossbar.h
+index 0b6d275..6960605 100644
+--- a/crossbar.h
++++ b/crossbar.h
+@@ -845,6 +845,27 @@ typedef union
+     gpio_out_config_t *gpio_out_config;
+ } xbar_cfg_ptr_t __attribute__ ((__transparent_union__));
+
++static inline xbar_cfg_ptr_t xbar_pwm_cfg (pwm_config_t *config)
++{
++    xbar_cfg_ptr_t cfg = {0};
++    cfg.pwm_config = config;
++    return cfg;
++}
++
++static inline xbar_cfg_ptr_t xbar_gpio_in_cfg (gpio_in_config_t *config)
++{
++    xbar_cfg_ptr_t cfg = {0};
++    cfg.gpio_in_config = config;
++    return cfg;
++}
++
++static inline xbar_cfg_ptr_t xbar_gpio_out_cfg (gpio_out_config_t *config)
++{
++    xbar_cfg_ptr_t cfg = {0};
++    cfg.gpio_out_config = config;
++    return cfg;
++}
++
+ struct xbar;
+
+ typedef float (*xbar_get_value_ptr)(struct xbar *pin);
+diff --git a/encoders.h b/encoders.h
+index 26d0c97..052db84 100644
+--- a/encoders.h
++++ b/encoders.h
+@@ -326,7 +326,7 @@ static inline void _encoder_pin_claimed (uint8_t port, xbar_t *pin)
+                     .debounce = On,
+                     .pull_mode = PullMode_Up
+                 };
+-                pin->config(pin, &config, false);
++                pin->config(pin, xbar_gpio_in_cfg(&config), false);
+             }
+             break;
+
+diff --git a/ioports.c b/ioports.c
+index 138f35a..f132538 100644
+--- a/ioports.c
++++ b/ioports.c
+@@ -630,7 +630,7 @@ FLASHMEM bool ioport_analog_out_config (uint8_t port, pwm_config_t *config)
+     xbar_t *pin;
+     bool ok = (pin = hal.port.get_pin_info(Port_Analog, Port_Output, port)) && pin->config;
+
+-    return ok && pin->config(pin, config, false);
++    return ok && pin->config(pin, xbar_pwm_cfg(config), false);
+ }
+
+ FLASHMEM bool ioport_digital_in_config (uint8_t port, gpio_in_config_t *config)
+@@ -638,7 +638,7 @@ FLASHMEM bool ioport_digital_in_config (uint8_t port, gpio_in_config_t *config)
+     xbar_t *pin;
+     bool ok = (pin = hal.port.get_pin_info(Port_Digital, Port_Input, port)) && pin->config;
+
+-    return ok && pin->config(pin, config, false);
++    return ok && pin->config(pin, xbar_gpio_in_cfg(config), false);
+ }
+
+ FLASHMEM bool ioport_enable_irq (uint8_t port, pin_irq_mode_t irq_mode, ioport_interrupt_callback_ptr handler)
+@@ -651,7 +651,7 @@ FLASHMEM bool ioport_digital_out_config (uint8_t port, gpio_out_config_t *config
+     xbar_t *pin;
+     bool ok = (pin = hal.port.get_pin_info(Port_Digital, Port_Output, port)) && pin->config && !(pin->mode.pwm || pin->mode.servo_pwm);
+
+-    return ok && pin->config(pin, config, false);
++    return ok && pin->config(pin, xbar_gpio_out_cfg(config), false);
+ }
+
+ FLASHMEM bool ioport_digital_pwm_config (uint8_t port, pwm_config_t *config)
+@@ -659,7 +659,7 @@ FLASHMEM bool ioport_digital_pwm_config (uint8_t port, pwm_config_t *config)
+     xbar_t *pin;
+     bool ok = (pin = hal.port.get_pin_info(Port_Digital, Port_Output, port)) && pin->config && pin->mode.claimed && pin->cap.pwm;
+
+-    return ok && pin->config(pin, config, false);
++    return ok && pin->config(pin, xbar_pwm_cfg(config), false);
+ }
+
+ // HAL wrapper/veneers
+@@ -1275,7 +1275,7 @@ FLASHMEM static status_code_t aux_set_value (setting_id_t id, uint_fast16_t valu
+                         if(xbar->config && is_aux(&ports_cfg[Port_DigitalIn], xbar->function)) {
+                             config.pull_mode = (pull_mode_t)xbar->mode.pull_mode;
+                             config.inverted = !!(change.mask & (1 << port));
+-                            xbar->config(xbar, &config, false);
++                            xbar->config(xbar, xbar_gpio_in_cfg(&config), false);
+                         }
+                     }
+                     port++;
+@@ -1302,7 +1302,7 @@ FLASHMEM static status_code_t aux_set_value (setting_id_t id, uint_fast16_t valu
+                             config.pull_mode = change.mask & (1 << port) ? PullMode_Down : PullMode_Up;
+                             config.inverted = xbar->mode.inverted && is_aux(&ports_cfg[Port_DigitalIn], xbar->function);
+                             config.debounce = xbar->mode.inverted;
+-                            xbar->config(xbar, &config, false);
++                            xbar->config(xbar, xbar_gpio_in_cfg(&config), false);
+                         }
+                     }
+                     port++;
+@@ -1328,7 +1328,7 @@ FLASHMEM static status_code_t aux_set_value (setting_id_t id, uint_fast16_t valu
+                         if(xbar->config && !(xbar->mode.pwm || xbar->mode.servo_pwm) && is_aux(&ports_cfg[Port_DigitalOut], xbar->function)) {
+                             config.inverted = !!(change.mask & (1 << port));
+                             config.open_drain = xbar->mode.open_drain;
+-                            xbar->config(xbar, &config, false);
++                            xbar->config(xbar, xbar_gpio_out_cfg(&config), false);
+                         }
+                     }
+                     port++;
+@@ -1354,7 +1354,7 @@ FLASHMEM static status_code_t aux_set_value (setting_id_t id, uint_fast16_t valu
+                         if(xbar->config && !(xbar->mode.pwm || xbar->mode.servo_pwm)) {
+                             config.inverted = xbar->mode.inverted && is_aux(&ports_cfg[Port_DigitalOut], xbar->function);
+                             config.open_drain = !!(change.mask & (1 << port));
+-                            xbar->config(xbar, &config, false);
++                            xbar->config(xbar, xbar_gpio_out_cfg(&config), false);
+                         }
+                     }
+                     port++;
+@@ -1489,7 +1489,7 @@ FLASHMEM void ioport_setting_changed (setting_id_t id)
+                                 settings.ioport.invert_in.mask |= (1 << port);
+                             else
+                                 settings.ioport.invert_in.mask &= ~(1 << port);
+-                            xbar->config(xbar, &in_config, false);
++                            xbar->config(xbar, xbar_gpio_in_cfg(&in_config), false);
+                         }
+                     }
+                 } while(port);
+@@ -1523,7 +1523,7 @@ FLASHMEM void ioport_setting_changed (setting_id_t id)
+                             else
+                                 settings.ioport.invert_in.mask &= ~(1 << port);
+
+-                            xbar->config(xbar, &in_config, false);
++                            xbar->config(xbar, xbar_gpio_in_cfg(&in_config), false);
+                         }
+                     }
+                 } while(port);
+@@ -1573,7 +1573,7 @@ FLASHMEM static void ioports_configure (settings_t *settings)
+                         in_config.pull_mode = PullMode_Up;
+                 }
+             }
+-            xbar->config(xbar, &in_config, false);
++            xbar->config(xbar, xbar_gpio_in_cfg(&in_config), false);
+         }
+     } while(port);
+
+@@ -1584,7 +1584,7 @@ FLASHMEM static void ioports_configure (settings_t *settings)
+             if(xbar->config && (cfg->bus.mask & (1 << port)) && !(xbar->mode.pwm || xbar->mode.servo_pwm)) {
+                 out_config.inverted = (settings->ioport.invert_out.mask & (1 << port)) && is_aux(cfg, xbar->function);
+                 out_config.open_drain = !!(settings->ioport.od_enable_out.mask & (1 << port));
+-                xbar->config(xbar, &out_config, false);
++                xbar->config(xbar, xbar_gpio_out_cfg(&out_config), false);
+             } else // TODO: same for inputs?
+                 setting_remove_elements(Settings_IoPort_InvertOut, cfg->bus.mask & ~(1 << port), false);
+         }
+diff --git a/ioports.h b/ioports.h
+index 0b840d9..984f256 100644
+--- a/ioports.h
++++ b/ioports.h
+@@ -182,6 +182,33 @@ typedef union {
+     limit_signals_t *limits;
+ } driver_caps_t __attribute__ ((__transparent_union__));
+
++static inline driver_caps_t driver_caps_none (void)
++{
++    driver_caps_t caps = {0};
++    return caps;
++}
++
++static inline driver_caps_t driver_caps_control (control_signals_t *control)
++{
++    driver_caps_t caps = {0};
++    caps.control = control;
++    return caps;
++}
++
++static inline driver_caps_t driver_caps_coolant (coolant_state_t *coolant)
++{
++    driver_caps_t caps = {0};
++    caps.coolant = coolant;
++    return caps;
++}
++
++static inline driver_caps_t driver_caps_limits (limit_signals_t *limits)
++{
++    driver_caps_t caps = {0};
++    caps.limits = limits;
++    return caps;
++}
++
+ typedef union {
+     uint8_t io;
+     struct {
+diff --git a/modbus_rtu.c b/modbus_rtu.c
+index 1d67e6c..19946d1 100644
+--- a/modbus_rtu.c
++++ b/modbus_rtu.c
+@@ -604,7 +604,7 @@ FLASHMEM void modbus_rtu_init (int8_t instance, int8_t dir_aux)
+
+             if((dir_pin = d_out.claim(&d_out, &dir_port, NULL, (pin_cap_t){}))) {
+                 stream.set_direction = modbus_set_direction;
+-                ioport_set_function(dir_pin, Output_RS485_Direction, NULL);
++                ioport_set_function(dir_pin, Output_RS485_Direction, driver_caps_none());
+             }
+
+             hal.driver_cap.modbus_rtu = !!stream.set_direction;
+diff --git a/pin_bits_masks.h b/pin_bits_masks.h
+index 9d42a20..661e9cb 100644
+--- a/pin_bits_masks.h
++++ b/pin_bits_masks.h
+@@ -270,7 +270,7 @@ static inline xbar_t *aux_ctrl_claim_port (aux_ctrl_t *aux_ctrl)
+         if(aux_ctrl->port != IOPORT_UNASSIGNED && (pin = ioport_claim(Port_Digital, Port_Input, &aux_ctrl->port, NULL))) {
+             aux_ctrl->gpio.port = pin->port;
+             aux_ctrl->gpio.pin = pin->pin;
+-            if(ioport_set_function(pin, aux_ctrl->function, &aux_ctrl->signal))
++            if(ioport_set_function(pin, aux_ctrl->function, driver_caps_control(&aux_ctrl->signal)))
+                 pin->function = aux_ctrl->function;
+         } else
+             aux_ctrl->port = IOPORT_UNASSIGNED;
+@@ -338,7 +338,7 @@ static bool __claim_in_port (xbar_t *properties, uint8_t port, void *data)
+         ((aux_ctrl_t *)data)->port = port;
+         ((aux_ctrl_t *)data)->gpio.port = properties->port;
+         ((aux_ctrl_t *)data)->gpio.pin = properties->pin;
+-        ioport_set_function(properties, ((aux_ctrl_t *)data)->function, &((aux_ctrl_t *)data)->signal);
++        ioport_set_function(properties, ((aux_ctrl_t *)data)->function, driver_caps_control(&((aux_ctrl_t *)data)->signal));
+     }
+
+     return ((aux_ctrl_t *)data)->port != IOPORT_UNASSIGNED;
+@@ -379,7 +379,7 @@ static inline void aux_ctrl_claim_ports (aux_claim_explicit_ptr aux_claim_explic
+         if(aux_ctrl[idx].gpio.port == (void *)EXPANDER_PORT) {
+             if(ioports_enumerate(Port_Digital, Port_Input, (pin_cap_t){ .irq_mode = aux_ctrl[idx].irq_mode, .external = On, .claimable = On }, __find_in_ext, &aux_ctrl[idx])) {
+                 if((aux_ctrl[idx].input = ioport_claim(Port_Digital, Port_Input, &aux_ctrl[idx].port, NULL))) {
+-                    ioport_set_function((xbar_t *)aux_ctrl[idx].input, aux_ctrl[idx].function, NULL);
++                    ioport_set_function((xbar_t *)aux_ctrl[idx].input, aux_ctrl[idx].function, driver_caps_none());
+                     aux_claim_explicit(&aux_ctrl[idx]);
+                 }
+             }
+@@ -556,7 +556,7 @@ static bool ___claim_out_port_explicit (aux_ctrl_out_t *aux_ctrl)
+     xbar_t *pin;
+
+     if((pin = ioport_claim(Port_Digital, Port_Output, &aux_ctrl->port, NULL)))
+-        ioport_set_function(pin, aux_ctrl->function, NULL);
++        ioport_set_function(pin, aux_ctrl->function, driver_caps_none());
+     else
+         aux_ctrl->port = IOPORT_UNASSIGNED;
+
+@@ -580,7 +580,7 @@ static inline void aux_ctrl_claim_out_ports (aux_claim_explicit_out_ptr aux_clai
+         if(aux_ctrl_out[idx].gpio.port == (void *)EXPANDER_PORT) {
+             if(ioports_enumerate(Port_Digital, Port_Output, (pin_cap_t){ .external = On, .claimable = On }, aux_claim, &aux_ctrl_out[idx])) {
+                 if((aux_ctrl_out[idx].output = ioport_claim(Port_Digital, Port_Output, &aux_ctrl_out[idx].port, NULL))) {
+-                    if(ioport_set_function((xbar_t *)aux_ctrl_out[idx].output, aux_ctrl_out[idx].function, NULL))
++                    if(ioport_set_function((xbar_t *)aux_ctrl_out[idx].output, aux_ctrl_out[idx].function, driver_caps_none()))
+                         aux_claim_explicit(&aux_ctrl_out[idx]);
+                 }
+             }
+diff --git a/planner.c b/planner.c
+index 8f6b650..7c3ce55 100644
+--- a/planner.c
++++ b/planner.c
+@@ -293,7 +293,7 @@ plan_block_t *plan_get_recent_block (void)
+ }
+
+
+-inline float plan_get_exec_block_exit_speed_sqr (void)
++float plan_get_exec_block_exit_speed_sqr (void)
+ {
+     plan_block_t *block = block_buffer.tail->next;
+     return block == block_buffer.head ? 0.0f : block->entry_speed_sqr;

@@ -44,7 +44,6 @@ typedef struct arg_vars {
     double step_time;
     uint8_t comment_char;
     uint16_t ws_port;       // WebSocket port (replaces raw telnet)
-    uint16_t http_port;     // HTTP port for UF2 upload
 } arg_vars_t;
 
 extern arg_vars_t args;

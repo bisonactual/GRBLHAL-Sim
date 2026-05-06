@@ -1,4 +1,63 @@
-build/
-EEPROM.DAT
-*.o
+# Build directories
+/build/
+/build-*/
+/build-release/
+/cmake-build-*/
+/out/
+
+# Release outputs
+/dist/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# Runtime simulator state
+/EEPROM.DAT
+/sdcard/
+*.step
+*.block
+*.log
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPackConfig.cmake
+CPackSourceConfig.cmake
+CTestTestfile.cmake
+Makefile
+install_manifest.txt
+
+# Compiler/linker outputs
+*.a
+*.dll
+*.dylib
 *.exe
+*.exp
+*.ilk
+*.lib
+*.o
+*.obj
+*.pdb
+*.so
+
+# Visual Studio/MSBuild
+.vs/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+x64/
+Release/
+Debug/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.kiro/

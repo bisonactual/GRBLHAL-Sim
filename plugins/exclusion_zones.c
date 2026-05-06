@@ -11,11 +11,19 @@
     bit 2 = allow_toolchange  (Tool-change macros may enter)
     bit 3 = enabled           (Zone is active)
 
+  Zone 0 is reserved for the ATCi plugin — it mirrors settings $684-$687
+  (X min, Y min, X max, Y max) with Z undefined (blocks all depths).
+  It bans gcode and jog but allows toolchange. Cannot be written or deleted
+  via $ZONE commands.
+
+  If a zone has z_min == 0 and z_max == 0, the Z axis is ignored and the
+  zone blocks at all depths.
+
   Commands:
     $EXCLUSION=1 / $EXCLUSION=0                              — global enable/disable
-    $ZONE                                                    — list all zones
-    $ZONE=n,xmin,ymin,zmin,xmax,ymax,zmax,flags             — set/update zone
-    $ZONE-n                                                  — delete zone n
+    $ZONE                                                    — list active zones
+    $ZONE=n,xmin,ymin,zmin,xmax,ymax,zmax[,flags]           — set/update zone (n >= 1)
+    $ZONE-n                                                  — delete zone n (n >= 1)
 
   Realtime report appends: |EZ:EZ  (E=enabled, Z=inside a zone)
 */
@@ -38,41 +46,13 @@
 #include "grbl/plugins.h"
 #include "grbl/task.h"
 
-/* Maximum number of zones — override at compile time if needed */
-#ifndef EZ_MAX_ZONES
-#define EZ_MAX_ZONES 16
-#endif
+#include "exclusion_zones.h"
 
-/* Tolerance buffer so boundary-touching moves aren't falsely blocked */
-#define EZ_TOLERANCE 0.5f
-
-/* ── Data types ───────────────────────────────────────────────────────────── */
-
-/* Per-zone permission flags — if bit is SET, that operation is ALLOWED inside the zone */
-typedef union {
-    uint8_t value;
-    struct {
-        uint8_t allow_gcode      :1,
-                allow_jog        :1,
-                allow_toolchange :1,
-                enabled          :1,
-                unused           :4;
-    };
-} zone_flags_t;
-
-typedef struct {
-    float   x_min, y_min, z_min;
-    float   x_max, y_max, z_max;
-    zone_flags_t flags;
-} zone_t;
-
-typedef struct {
-    uint8_t count;
-    bool    global_enabled;
-    zone_t  zones[EZ_MAX_ZONES];
-} ez_config_t;
-
-typedef enum { OP_GCODE, OP_JOG, OP_TOOLCHANGE } ez_op_t;
+/* ── ATCi setting IDs (must match sienci-atci-plugin) ─────────────────────── */
+#define ATCI_SETTING_X_MIN 684
+#define ATCI_SETTING_Y_MIN 685
+#define ATCI_SETTING_X_MAX 686
+#define ATCI_SETTING_Y_MAX 687
 
 /* ── Static state ─────────────────────────────────────────────────────────── */
 
@@ -80,7 +60,6 @@ static ez_config_t config;
 static nvs_address_t nvs_addr;
 static bool tc_macro_running = false;
 
-/* Saved HAL pointers for chaining */
 static on_report_options_ptr   on_report_options   = NULL;
 static on_realtime_report_ptr  on_realtime_report  = NULL;
 static on_tool_selected_ptr    prev_on_tool_selected = NULL;
@@ -92,12 +71,48 @@ typedef void (*apply_travel_limits_ptr)(float *target, float *position, work_env
 static travel_limits_ptr       prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 
-/* Forward declarations — NVS */
 static void ez_save(void);
 static void ez_load(void);
 static void ez_restore(void);
 
+/* ── Zone 0 ATCi sync ────────────────────────────────────────────────────── */
+
+static void sync_zone0_from_atci(void)
+{
+    setting_id_t ids[4] = { ATCI_SETTING_X_MIN, ATCI_SETTING_Y_MIN,
+                            ATCI_SETTING_X_MAX, ATCI_SETTING_Y_MAX };
+    float vals[4] = { 0 };
+
+    for (int i = 0; i < 4; i++) {
+        setting_detail_t *s = setting_get_details(ids[i], NULL);
+        if (s)
+            vals[i] = setting_get_float_value(s, 0);
+    }
+
+    zone_t *z = &config.zones[0];
+    z->x_min = fminf(vals[0], vals[2]);
+    z->y_min = fminf(vals[1], vals[3]);
+    z->z_min = 0.0f;
+    z->x_max = fmaxf(vals[0], vals[2]);
+    z->y_max = fmaxf(vals[1], vals[3]);
+    z->z_max = 0.0f;
+    z->flags.value = 0x0C;
+
+    if (config.count < 1)
+        config.count = 1;
+}
+
+static void sync_zone0_delayed(void *data)
+{
+    sync_zone0_from_atci();
+}
+
 /* ── Zone geometry helpers ────────────────────────────────────────────────── */
+
+static inline bool zone_z_undefined(const zone_t *z)
+{
+    return z->z_min == 0.0f && z->z_max == 0.0f;
+}
 
 static inline void zone_normalize(zone_t *z)
 {
@@ -109,24 +124,31 @@ static inline void zone_normalize(zone_t *z)
 
 static bool point_in_zone(const zone_t *z, float x, float y, float zv)
 {
-    return x >= z->x_min && x <= z->x_max &&
-           y >= z->y_min && y <= z->y_max &&
-           zv >= z->z_min && zv <= z->z_max;
+    bool xy = x >= z->x_min && x <= z->x_max &&
+              y >= z->y_min && y <= z->y_max;
+    if (!xy) return false;
+    if (zone_z_undefined(z)) return true;
+    return zv >= z->z_min && zv <= z->z_max;
 }
 
-/*
-   3D Liang-Barsky segment/box intersection test.
-   Returns true if the segment from p0 to p1 passes through the zone
-   (shrunk by EZ_TOLERANCE so boundary-grazing moves are allowed).
-*/
+static bool point_deep_in_zone(const zone_t *z, float x, float y, float zv)
+{
+    bool xy = x > (z->x_min + EZ_TOLERANCE) && x < (z->x_max - EZ_TOLERANCE) &&
+              y > (z->y_min + EZ_TOLERANCE) && y < (z->y_max - EZ_TOLERANCE);
+    if (!xy) return false;
+    if (zone_z_undefined(z)) return true;
+    return zv > (z->z_min + EZ_TOLERANCE) && zv < (z->z_max - EZ_TOLERANCE);
+}
+
 static bool segment_intersects_zone(const zone_t *z, const float *p0, const float *p1)
 {
     float t0 = 0.0f, t1 = 1.0f;
+    int dims = zone_z_undefined(z) ? 2 : 3;
     float d[3]  = { p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2] };
     float lo[3] = { z->x_min + EZ_TOLERANCE, z->y_min + EZ_TOLERANCE, z->z_min + EZ_TOLERANCE };
     float hi[3] = { z->x_max - EZ_TOLERANCE, z->y_max - EZ_TOLERANCE, z->z_max - EZ_TOLERANCE };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < dims; i++) {
         float p_neg = -d[i], q_neg = p0[i] - lo[i];
         float p_pos =  d[i], q_pos = hi[i] - p0[i];
         if (p_neg == 0.0f && p_pos == 0.0f) {
@@ -144,18 +166,15 @@ static bool segment_intersects_zone(const zone_t *z, const float *p0, const floa
     return t0 < t1;
 }
 
-/*
-   Clip a segment at the first entry point into a zone.
-   Writes the clipped endpoint into `clipped` and returns true if clipping occurred.
-*/
 static bool clip_to_zone_boundary(const zone_t *z, const float *start, const float *end, float *clipped)
 {
     float t0 = 0.0f, t1 = 1.0f;
+    int dims = zone_z_undefined(z) ? 2 : 3;
     float d[3]  = { end[0] - start[0], end[1] - start[1], end[2] - start[2] };
     float lo[3] = { z->x_min, z->y_min, z->z_min };
     float hi[3] = { z->x_max, z->y_max, z->z_max };
 
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < dims; i++) {
         float p_neg = -d[i], q_neg = start[i] - lo[i];
         float p_pos =  d[i], q_pos = hi[i] - start[i];
         if (p_neg == 0.0f && p_pos == 0.0f) {
@@ -175,7 +194,8 @@ static bool clip_to_zone_boundary(const zone_t *z, const float *start, const flo
         memcpy(clipped, end, sizeof(float) * N_AXIS);
         clipped[X_AXIS] = start[0] + t0 * d[0];
         clipped[Y_AXIS] = start[1] + t0 * d[1];
-        clipped[Z_AXIS] = start[2] + t0 * d[2];
+        if (!zone_z_undefined(z))
+            clipped[Z_AXIS] = start[2] + t0 * d[2];
         return true;
     }
     return false;
@@ -185,7 +205,6 @@ static bool clip_to_zone_boundary(const zone_t *z, const float *start, const flo
 
 static bool op_allowed_in_zone(const zone_t *z, ez_op_t op)
 {
-    if (!z->flags.enabled) return true; /* inactive zone blocks nothing */
     switch (op) {
         case OP_GCODE:      return z->flags.allow_gcode;
         case OP_JOG:        return z->flags.allow_jog;
@@ -201,26 +220,40 @@ static ez_op_t current_op(void)
 
 /* ── Travel-limit hooks ───────────────────────────────────────────────────── */
 
-/*
-   check_travel_limits — called for G-code moves.
-   Return false to reject the move entirely.
-*/
 static bool ez_check_travel(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope)
 {
     if (config.global_enabled) {
         float *pos = plan_get_position();
-        float p0[3] = { pos ? pos[X_AXIS] : 0.0f, pos ? pos[Y_AXIS] : 0.0f, pos ? pos[Z_AXIS] : 0.0f };
-        float p1[3] = { target[X_AXIS], target[Y_AXIS], target[Z_AXIS] };
+        float x0 = pos ? pos[X_AXIS] : 0.0f;
+        float y0 = pos ? pos[Y_AXIS] : 0.0f;
+        float z0 = pos ? pos[Z_AXIS] : 0.0f;
+        float xt = target[X_AXIS];
+        float yt = target[Y_AXIS];
+        float zt = target[Z_AXIS];
         ez_op_t op = current_op();
 
         for (uint8_t i = 0; i < config.count; i++) {
             zone_t *z = &config.zones[i];
-            if (!z->flags.enabled || op_allowed_in_zone(z, op))
+            if (!z->flags.enabled)
+                continue;
+            if (op_allowed_in_zone(z, op))
                 continue;
 
-            if (point_in_zone(z, p1[0], p1[1], p1[2]) ||
-                segment_intersects_zone(z, p0, p1)) {
-                report_message("EZ: Move blocked by exclusion zone", Message_Warning);
+            if (point_deep_in_zone(z, xt, yt, zt)) {
+                if (point_deep_in_zone(z, x0, y0, z0))
+                    report_message("EZ: Inside exclusion zone — disable zone to move out", Message_Warning);
+                else
+                    report_message("EZ: Target inside exclusion zone", Message_Warning);
+                return false;
+            }
+
+            float p0[3] = { x0, y0, z0 };
+            float p1[3] = { xt, yt, zt };
+            if (segment_intersects_zone(z, p0, p1)) {
+                if (point_deep_in_zone(z, x0, y0, z0))
+                    report_message("EZ: Inside exclusion zone — disable zone to move out", Message_Warning);
+                else
+                    report_message("EZ: Move crosses exclusion zone", Message_Warning);
                 return false;
             }
         }
@@ -230,37 +263,44 @@ static bool ez_check_travel(float *target, axes_signals_t axes, bool is_cartesia
         : true;
 }
 
-/*
-   apply_travel_limits — called for jog moves.
-   Clip the target to the zone boundary instead of outright rejecting.
-*/
 static void ez_apply_travel(float *target, float *position, work_envelope_t *envelope)
 {
     if (config.global_enabled) {
-        float p0[3] = { position[X_AXIS], position[Y_AXIS], position[Z_AXIS] };
-        float p1[3] = { target[X_AXIS],   target[Y_AXIS],   target[Z_AXIS] };
+        float x0 = position[X_AXIS];
+        float y0 = position[Y_AXIS];
+        float z0 = position[Z_AXIS];
 
         for (uint8_t i = 0; i < config.count; i++) {
             zone_t *z = &config.zones[i];
-            if (!z->flags.enabled || op_allowed_in_zone(z, OP_JOG))
+            if (!z->flags.enabled)
+                continue;
+            if (op_allowed_in_zone(z, OP_JOG))
                 continue;
 
-            /* Already inside — freeze until user disables zone */
-            if (point_in_zone(z, p0[0], p0[1], p0[2])) {
+            if (point_deep_in_zone(z, x0, y0, z0)) {
                 report_message("EZ: Inside exclusion zone — disable zone to jog out", Message_Warning);
                 memcpy(target, position, sizeof(float) * N_AXIS);
                 return;
             }
 
-            /* Clip at boundary */
-            if (segment_intersects_zone(z, p0, p1)) {
+            float xt = target[X_AXIS];
+            float yt = target[Y_AXIS];
+            float zt = target[Z_AXIS];
+
+            bool target_inside = point_deep_in_zone(z, xt, yt, zt);
+            float p0[3] = { x0, y0, z0 };
+            float p1[3] = { xt, yt, zt };
+            bool intersects = segment_intersects_zone(z, p0, p1);
+
+            if (target_inside || intersects) {
                 float clipped[N_AXIS];
                 if (clip_to_zone_boundary(z, position, target, clipped)) {
                     report_message("EZ: Jog clipped at exclusion boundary", Message_Warning);
                     memcpy(target, clipped, sizeof(float) * N_AXIS);
-                    p1[0] = target[X_AXIS];
-                    p1[1] = target[Y_AXIS];
-                    p1[2] = target[Z_AXIS];
+                } else {
+                    report_message("EZ: Jog blocked at exclusion boundary", Message_Warning);
+                    memcpy(target, position, sizeof(float) * N_AXIS);
+                    return;
                 }
             }
         }
@@ -284,21 +324,12 @@ static void ez_tool_changed(tool_data_t *tool)
     if (prev_on_tool_changed) prev_on_tool_changed(tool);
 }
 
-/* ── $ command handler ─────────────────────────────────────────────────────
-   $EXCLUSION=1 / $EXCLUSION=0   — global enable/disable
-   $ZONE                         — list all zones
-   $ZONE=n,xmin,ymin,zmin,xmax,ymax,zmax[,flags]  — set/add zone
-   $ZONE-n                       — delete zone n
-
-   flags byte: bit0=allow_gcode, bit1=allow_jog, bit2=allow_toolchange, bit3=enabled
-   If flags < 8 the enabled bit is set automatically for convenience.
-   ──────────────────────────────────────────────────────────────────────── */
+/* ── $ command handler ───────────────────────────────────────────────────── */
 
 static status_code_t ez_sys_command(sys_state_t state, char *line)
 {
     char buf[160];
 
-    /* ── $EXCLUSION=0/1 ── */
     if (strncmp(line, "EXCLUSION=", 10) == 0) {
         config.global_enabled = (line[10] != '0');
         ez_save();
@@ -308,9 +339,12 @@ static status_code_t ez_sys_command(sys_state_t state, char *line)
         return Status_OK;
     }
 
-    /* ── $ZONE-n  (delete) ── */
     if (strncmp(line, "ZONE-", 5) == 0) {
         uint8_t slot = (uint8_t)atoi(line + 5);
+        if (slot == 0) {
+            report_message("EZ: Zone 0 is reserved for ATCi", Message_Warning);
+            return Status_InvalidStatement;
+        }
         if (slot >= config.count)
             return Status_InvalidStatement;
         memmove(&config.zones[slot],
@@ -325,7 +359,6 @@ static status_code_t ez_sys_command(sys_state_t state, char *line)
         return Status_OK;
     }
 
-    /* ── $ZONE=n,xmin,ymin,zmin,xmax,ymax,zmax[,flags] ── */
     if (strncmp(line, "ZONE=", 5) == 0) {
         unsigned slot, flags = 0;
         float xmin, ymin, zmin, xmax, ymax, zmax;
@@ -333,13 +366,16 @@ static status_code_t ez_sys_command(sys_state_t state, char *line)
                             &slot, &xmin, &ymin, &zmin, &xmax, &ymax, &zmax, &flags);
         if (parsed < 7)
             return Status_InvalidStatement;
+        if (slot == 0) {
+            report_message("EZ: Zone 0 is reserved for ATCi", Message_Warning);
+            return Status_InvalidStatement;
+        }
         if (slot >= EZ_MAX_ZONES)
             return Status_InvalidStatement;
 
         zone_t *z = &config.zones[slot];
         z->x_min = xmin; z->y_min = ymin; z->z_min = zmin;
         z->x_max = xmax; z->y_max = ymax; z->z_max = zmax;
-        /* If flags < 8 (enabled bit not explicitly set), force enabled on */
         z->flags.value = (parsed < 8 || flags < 8) ? ((uint8_t)flags | 0x08) : (uint8_t)flags;
         zone_normalize(z);
         if (slot >= config.count)
@@ -351,14 +387,20 @@ static status_code_t ez_sys_command(sys_state_t state, char *line)
         return Status_OK;
     }
 
-    /* ── $ZONE  (list all) ── */
     if (strcmp(line, "ZONE") == 0) {
-        snprintf(buf, sizeof(buf), "[EZ:%s,%d zones]",
-                 config.global_enabled ? "enabled" : "disabled", config.count);
+        sync_zone0_from_atci();
+
+        uint8_t active = 0;
+        for (uint8_t i = 0; i < config.count; i++) {
+            if (config.zones[i].flags.enabled) active++;
+        }
+        snprintf(buf, sizeof(buf), "[EZ:%s,%d active]",
+                 config.global_enabled ? "enabled" : "disabled", active);
         hal.stream.write(buf);
         hal.stream.write(ASCII_EOL);
         for (uint8_t i = 0; i < config.count; i++) {
             zone_t *z = &config.zones[i];
+            if (!z->flags.enabled) continue;
             snprintf(buf, sizeof(buf),
                      "[ZONE:%d|%.2f,%.2f,%.2f,%.2f,%.2f,%.2f|%u]",
                      i, z->x_min, z->y_min, z->z_min,
@@ -381,7 +423,7 @@ static void ez_report_options(bool newopt)
 {
     if (on_report_options) on_report_options(newopt);
     if (!newopt)
-        report_plugin("Exclusion Zones", "1.0.0");
+        report_plugin("Exclusion Zones", "1.1.0");
 }
 
 static void ez_realtime_report(stream_write_ptr stream_write, report_tracking_flags_t report)
@@ -390,7 +432,7 @@ static void ez_realtime_report(stream_write_ptr stream_write, report_tracking_fl
         char buf[16] = "|EZ:";
         char *p = buf + 4;
 
-        *p++ = 'E'; /* global enabled */
+        *p++ = 'E';
 
         float *pos = plan_get_position();
         if (pos) {
@@ -432,7 +474,8 @@ static void ez_load(void)
     for (uint8_t i = 0; i < config.count; i++)
         zone_normalize(&config.zones[i]);
 
-    /* Hook into grblHAL — only once */
+    task_add_delayed(sync_zone0_delayed, NULL, 5000);
+
     if (prev_check_travel_limits == NULL) {
         prev_check_travel_limits = grbl.check_travel_limits;
         grbl.check_travel_limits = ez_check_travel;
@@ -469,7 +512,7 @@ void exclusion_zones_init(void)
 
     if ((nvs_addr = nvs_alloc(sizeof(config)))) {
         settings_register(&settings);
-        report_message("Exclusion Zones v1.0.0 initialized", Message_Info);
+        report_message("Exclusion Zones v1.1.0 initialized", Message_Info);
     }
 }
 

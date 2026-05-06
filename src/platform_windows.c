@@ -69,7 +69,24 @@ void platform_kill_thread(plat_thread_t *th)
 
 uint8_t platform_poll_stdin(void)
 {
-    if (_kbhit())
-        return (uint8_t)getch();
+    HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD type = GetFileType(input);
+
+    if (type == FILE_TYPE_CHAR) {
+        if (_kbhit())
+            return (uint8_t)getch();
+        return 0;
+    }
+
+    if (type == FILE_TYPE_PIPE) {
+        DWORD available = 0;
+        if (PeekNamedPipe(input, NULL, 0, NULL, &available, NULL) && available > 0) {
+            char c = 0;
+            DWORD read = 0;
+            if (ReadFile(input, &c, 1, &read, NULL) && read == 1)
+                return (uint8_t)c;
+        }
+    }
+
     return 0;
 }

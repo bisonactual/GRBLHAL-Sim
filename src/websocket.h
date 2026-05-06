@@ -24,6 +24,14 @@ uint8_t ws_getchar(void);
 // Buffers internally and flushes on newline.
 void ws_putchar(uint8_t data);
 
+// Drop outbound grblHAL data while keeping the client socket connected.
+// Returns the new mute state.
+bool ws_toggle_tx_muted(void);
+
+// Close the active client connection, if present. Returns true if a client was
+// connected and kicked.
+bool ws_kick_client(void);
+
 // Cleanup
 void ws_shutdown(void);
 

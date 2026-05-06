@@ -12,6 +12,7 @@
 #include <termios.h>
 #include <time.h>
 #include <sys/time.h>
+#include <sys/select.h>
 #include "platform.h"
 
 #define MS_PER_SEC 1000000
@@ -58,7 +59,8 @@ static void enable_kbhit(int dir)
 static int kbhit(void)
 {
     struct timeval tv = {0};
-    fd_set rdfs = {{0}};
+    fd_set rdfs;
+    FD_ZERO(&rdfs);
     FD_SET(STDIN_FILENO, &rdfs);
     select(STDIN_FILENO + 1, &rdfs, NULL, NULL, &tv);
     return FD_ISSET(STDIN_FILENO, &rdfs);

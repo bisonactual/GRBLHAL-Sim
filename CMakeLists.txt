@@ -7,102 +7,61 @@ add_compile_definitions(F_CPU=16000000)
 add_compile_definitions(GRBL_SIM)
 add_compile_definitions(N_AXIS=5)
 
-# ── FlexiHAL ATC + simulated SD card (static, on by default) ───────────
-# These are always-on unless explicitly disabled:
-#   cmake .. -DENABLE_ATC=OFF -DENABLE_SDCARD=OFF
-option(ENABLE_ATC    "Enable FlexiHAL ATC + tooltable plugin" ON)
-option(ENABLE_SDCARD "Enable simulated SD card (host-backed VFS)" ON)
+# Simulator defaults
+add_compile_definitions(DEFAULT_HOMING_ENABLE=1)
+add_compile_definitions(DEFAULT_HOMING_INIT_LOCK=1)
+add_compile_definitions(DEFAULT_HOMING_FORCE_SET_ORIGIN=1)
+add_compile_definitions(DEFAULT_X_MAX_TRAVEL=600.0f)
+add_compile_definitions(DEFAULT_Y_MAX_TRAVEL=600.0f)
+add_compile_definitions(DEFAULT_SOFT_LIMIT_ENABLE=1)
+add_compile_definitions(DEFAULT_JOG_LIMIT_ENABLE=1)
 
-if(ENABLE_SDCARD)
-    add_compile_definitions(SDCARD_ENABLE=1)
-    # FS_ENABLE is normally derived by driver_opts.h (not included by core).
-    # Define it directly: FS_SDCARD(0b00010) | FS_FATFS(0b00001) = 3
-    add_compile_definitions(FS_ENABLE=3)
+# FlexiHAL simulator profile (static, always on)
+add_compile_definitions(SDCARD_ENABLE=1)
+add_compile_definitions(FS_ENABLE=3)
+add_compile_definitions(NGC_EXPRESSIONS_ENABLE=1)
+add_compile_definitions(ATCI_ENABLE=1)
+add_compile_definitions(EXCLUSION_ZONES_ENABLE=1)
+
+# Bundled plugins
+# Keep the simulator build deterministic. Runtime plugin upload/rebuild is
+# intentionally not part of the distributable simulator.
+set(plugin_SRC
+    plugins/sienci-atci-plugin.c
+    plugins/exclusion_zones.c
+)
+
+# grblHAL core
+# Keep the upstream grblHAL/core submodule clean and apply our simulator
+# compatibility patch into the build tree.
+find_package(Git REQUIRED)
+
+set(GRBL_CORE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/grbl")
+set(GRBL_CORE_PATCH "${CMAKE_SOURCE_DIR}/packaging/grbl-core-flexihal-sim.patch")
+set(GRBL_CORE_BUILD_ROOT "${CMAKE_BINARY_DIR}/patched-src")
+set(GRBL_CORE_BUILD_DIR "${GRBL_CORE_BUILD_ROOT}/grbl")
+
+file(REMOVE_RECURSE "${GRBL_CORE_BUILD_DIR}")
+file(MAKE_DIRECTORY "${GRBL_CORE_BUILD_DIR}")
+file(COPY "${GRBL_CORE_SOURCE_DIR}/" DESTINATION "${GRBL_CORE_BUILD_DIR}"
+     PATTERN ".git" EXCLUDE)
+
+execute_process(
+    COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${GRBL_CORE_PATCH}"
+    WORKING_DIRECTORY "${GRBL_CORE_BUILD_DIR}"
+    RESULT_VARIABLE GRBL_CORE_PATCH_RESULT
+    OUTPUT_VARIABLE GRBL_CORE_PATCH_OUTPUT
+    ERROR_VARIABLE GRBL_CORE_PATCH_ERROR
+)
+if(NOT GRBL_CORE_PATCH_RESULT EQUAL 0)
+    message(FATAL_ERROR
+        "Failed to apply grblHAL core simulator patch:\n"
+        "${GRBL_CORE_PATCH_OUTPUT}\n${GRBL_CORE_PATCH_ERROR}")
 endif()
 
-if(ENABLE_ATC)
-    add_compile_definitions(ATC_ENABLE=2)
-    add_compile_definitions(TOOLTABLE_ENABLE=2)
-    add_compile_definitions(NGC_EXPRESSIONS_ENABLE=1)
-endif()
+include("${GRBL_CORE_BUILD_DIR}/CMakeLists.txt")
 
-# ── Plugin toggles ──────────────────────────────────────────────────────
-# Enable plugins by passing -DPLUGIN_EXCLUSION_ZONES=ON to cmake, e.g.:
-#   cmake .. -DPLUGIN_EXCLUSION_ZONES=ON
-#
-# Or enable them all:
-#   cmake .. -DPLUGINS_ALL=ON
-#
-# Plugins can also be dropped into the plugins/ folder via the web UI.
-# The web UI triggers a rebuild that picks them up automatically.
-
-option(PLUGINS_ALL              "Enable all available plugins" OFF)
-option(PLUGIN_EXCLUSION_ZONES   "Enable Exclusion Zones plugin" OFF)
-
-# Collect plugin sources and defines
-set(plugin_SRC "")
-set(plugin_DEFS "")
-set(plugin_DIRS "")
-
-# ── Auto-discover plugins dropped via web UI ──
-file(GLOB webui_plugins "${CMAKE_SOURCE_DIR}/plugins/*.c")
-if(webui_plugins)
-    foreach(psrc ${webui_plugins})
-        get_filename_component(pname ${psrc} NAME_WE)
-        string(REPLACE "-" "_" pname_safe "${pname}")
-
-        # Skip plugins that are handled statically above
-        if(pname STREQUAL "flexihal_atc" OR pname STREQUAL "tooltable")
-            message(STATUS "Plugin (static): ${pname} — skipping auto-discover")
-            list(APPEND plugin_SRC "${psrc}")
-            continue()
-        endif()
-
-        list(APPEND plugin_SRC "${psrc}")
-
-        # Scan the .c file for its actual #if XXXX_ENABLE guard
-        file(READ "${psrc}" _plugin_src)
-        string(REGEX MATCH "#if[^\n]*([A-Z_]+_ENABLE)" _match "${_plugin_src}")
-        if(_match)
-            string(REGEX MATCH "([A-Z_]+_ENABLE)" _enable_macro "${_match}")
-            message(STATUS "Plugin (web UI): ${pname} -> guard: ${_enable_macro}")
-            list(APPEND plugin_DEFS "${_enable_macro}=1")
-        else()
-            # Fallback: uppercase sanitized filename
-            string(TOUPPER "${pname_safe}" pname_upper)
-            message(STATUS "Plugin (web UI): ${pname} -> guard (guessed): ${pname_upper}_ENABLE")
-            list(APPEND plugin_DEFS "${pname_upper}_ENABLE=1")
-        endif()
-    endforeach()
-    list(APPEND plugin_DIRS "${CMAKE_SOURCE_DIR}/plugins")
-endif()
-
-# ── Exclusion Zones (manual cmake flag) ──
-if(PLUGIN_EXCLUSION_ZONES OR PLUGINS_ALL)
-    # Look for the plugin in common locations
-    if(EXISTS "${CMAKE_SOURCE_DIR}/../exclusionzones/exclusion_zones/exclusion_zones.c")
-        set(EZ_DIR "${CMAKE_SOURCE_DIR}/../exclusionzones/exclusion_zones")
-    elseif(EXISTS "${CMAKE_SOURCE_DIR}/plugins/exclusion_zones.c")
-        # Already picked up by auto-discover above
-        set(EZ_DIR "")
-    else()
-        message(FATAL_ERROR "Exclusion Zones plugin enabled but source not found. "
-                "Expected at ../exclusionzones/exclusion_zones/ or plugins/exclusion_zones.c")
-    endif()
-    if(EZ_DIR)
-        message(STATUS "Plugin (cmake flag): Exclusion Zones (${EZ_DIR})")
-        list(APPEND plugin_SRC "${EZ_DIR}/exclusion_zones.c")
-        list(APPEND plugin_DEFS "EXCLUSION_ZONES_ENABLE=1")
-        list(APPEND plugin_DIRS "${EZ_DIR}")
-    endif()
-endif()
-
-# ── (Add more plugins here following the same pattern) ──
-
-# ── grblHAL core ────────────────────────────────────────────────────────
-include(src/grbl/CMakeLists.txt)
-
-# ── Platform ────────────────────────────────────────────────────────────
+# Platform
 if(WIN32)
     add_compile_definitions(PLATFORM_WINDOWS)
     set(platform_SRC
@@ -125,7 +84,7 @@ if(UNIX)
     endif()
 endif()
 
-# ── Simulator executable ────────────────────────────────────────────────
+# Simulator executable
 add_executable(grblHAL_flexihal_sim
     src/main.c
     src/simulator.c
@@ -136,7 +95,6 @@ add_executable(grblHAL_flexihal_sim
     src/serial.c
     src/grbl_interface.c
     src/websocket.c
-    src/uf2.c
     src/my_plugin.c
     src/fs_sim.c
     src/macros.c
@@ -144,33 +102,45 @@ add_executable(grblHAL_flexihal_sim
     ${platform_SRC}
 )
 
-# Plugin compile definitions
-foreach(def ${plugin_DEFS})
-    target_compile_definitions(grblHAL_flexihal_sim PRIVATE ${def})
-endforeach()
-
 # Plugin include directories (so plugins can #include "driver.h" etc.)
 target_include_directories(grblHAL_flexihal_sim PRIVATE
+    ${GRBL_CORE_BUILD_ROOT}
     ${CMAKE_SOURCE_DIR}/src
-    ${plugin_DIRS}
+    ${CMAKE_SOURCE_DIR}/plugins
 )
 
-target_link_libraries(grblHAL_flexihal_sim PRIVATE
-    m
+set(sim_LIBS
     grbl
     ${platform_LIB}
 )
 
-# ── Print plugin summary ───────────────────────────────────────────────
+if(NOT MSVC)
+    list(APPEND sim_LIBS m)
+endif()
+
+target_link_libraries(grblHAL_flexihal_sim PRIVATE ${sim_LIBS})
+
+if(MSVC)
+    file(TO_NATIVE_PATH "${CMAKE_SOURCE_DIR}/src/msvc_compat.h" MSVC_COMPAT_HEADER)
+    target_compile_options(grblHAL_flexihal_sim PRIVATE "/FI${MSVC_COMPAT_HEADER}")
+    target_compile_definitions(grblHAL_flexihal_sim PRIVATE _CRT_SECURE_NO_WARNINGS)
+endif()
+
+# Print plugin summary
 message(STATUS "")
 message(STATUS "=== grblHAL FlexiHAL Simulator Build ===")
-if(plugin_SRC)
-    message(STATUS "Plugins enabled:")
-    foreach(src ${plugin_SRC})
-        get_filename_component(name ${src} NAME_WE)
-        message(STATUS "  - ${name}")
-    endforeach()
-else()
-    message(STATUS "No plugins enabled. Use -DPLUGIN_EXCLUSION_ZONES=ON etc.")
-endif()
+message(STATUS "Bundled plugins:")
+foreach(src ${plugin_SRC})
+    get_filename_component(name ${src} NAME_WE)
+    message(STATUS "  - ${name}")
+endforeach()
 message(STATUS "")
+
+install(TARGETS grblHAL_flexihal_sim RUNTIME DESTINATION bin)
+install(FILES README.md src/grbl/COPYING DESTINATION share/grblhal-flexihal-sim)
+
+option(BUILD_WINDOWS_LAUNCHER "Build the native Windows launcher UI" ${WIN32})
+if(BUILD_WINDOWS_LAUNCHER)
+    enable_language(CXX)
+    add_subdirectory(ui/windows-launcher)
+endif()

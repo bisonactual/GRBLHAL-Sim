@@ -4,7 +4,9 @@
   Part of grblHAL FlexiHAL Simulator
 
   Compiles the real grblHAL core with a virtual HAL driver that emulates
-  the Expatria FlexiHAL controller. Connects to senders via WebSocket.
+  the Expatria FlexiHAL controller. Connects to senders over USB serial
+  (a host serial port standing in for the board's USB CDC port) and over
+  WebSocket, like the real board's USB and network streams.
 
   Based on grblHAL Simulator by Terje Io, Jens Geisler, Adam Shelly
 */
@@ -18,6 +20,7 @@
 #include "mcu.h"
 #include "eeprom.h"
 #include "grbl_interface.h"
+#include "usb_host.h"
 #include "websocket.h"
 
 #include "grbl/grbllib.h"
@@ -34,14 +37,19 @@ static void print_usage(const char *badarg)
         "grblHAL FlexiHAL Simulator\n\n"
         "Usage: %s [options]\n"
         "  Options:\n"
-        "    -w <port>   WebSocket port for sender connection (default: 8080)\n"
+        "    -w <port>   WebSocket port for sender connection (default: 8080, 0=off)\n"
+#ifdef WIN32
+        "    -u <port>   USB serial: COM port for the sender side (e.g. COM7 of a com0com pair)\n"
+#else
+        "    -u <path>   USB serial: symlink to create for the sender (e.g. /tmp/flexihal-usb)\n"
+#endif
         "    -t <speed>  Realtime speed multiplier (default: 1.0, 0=max)\n"
         "    -e <file>   EEPROM/settings file (default: EEPROM.DAT)\n"
         "    -r <time>   Step report interval in seconds (0=off)\n"
         "    -n          No comment prefix on serial output\n"
         "    -h          This help\n"
         "\n"
-        "  Keyboard controls (when WebSocket client connected):\n"
+        "  Keyboard controls:\n"
         "    e=E-Stop  r=Reset  h=FeedHold  s=CycleStart  d=SafetyDoor\n"
         "    p=Probe   x/y/z=Toggle limits  ?=Status report\n"
         "    1-9/0=Inject alarms 1-9/10  m=MotorFault alarm 17\n"
@@ -72,6 +80,8 @@ int main(int argc, char *argv[])
     args.step_time = 0.0f;
     args.ws_port = 8080;
 
+    const char *usb_path = NULL;
+
     set_eeprom_name("EEPROM.DAT");
     progname = argv[0];
 
@@ -82,6 +92,10 @@ int main(int argc, char *argv[])
                 case 'w':
                     argv++; argc--;
                     args.ws_port = (uint16_t)atoi(*argv);
+                    break;
+                case 'u':
+                    argv++; argc--;
+                    usb_path = *argv;
                     break;
                 case 't':
                     argv++; argc--;
@@ -114,16 +128,22 @@ int main(int argc, char *argv[])
 
     platform_init();
 
-    // Initialize WebSocket server
-    if (ws_init(args.ws_port) != 0) {
+    // The WebSocket client gets a grblHAL stream of its own.
+    if (args.ws_port && ws_init(args.ws_port) != 0) {
         printf("Fatal: Could not start WebSocket server on port %d\n", args.ws_port);
         return EXIT_FAILURE;
     }
 
-    // Wire up sim I/O to WebSocket
-    sim.getchar = ws_getchar;
-    sim.putchar = ws_putchar;
-    sim.socket_fd = 1; // Non-zero signals "network mode" to grbl_interface
+    // The emulated UART is the board's USB stream. Without -u it acts like a USB
+    // port with nothing plugged in.
+    if (usb_path && !usb_host_init(usb_path)) {
+        printf("Fatal: Could not open USB serial port %s\n", usb_path);
+        return EXIT_FAILURE;
+    }
+
+    sim.getchar = usb_host_getchar;     // with no port there's never DTR, so nothing goes in or out
+    sim.putchar = usb_host_putchar;
+    sim.socket_fd = 1; // Non-zero: stdin is free for simulator controls
 
     sim.on_init = grbl_app_init;
     sim.on_shutdown = grbl_app_exit;
@@ -143,11 +163,20 @@ int main(int argc, char *argv[])
     signal(SIGTERM, exithandler);
     signal(SIGINT, exithandler);
 
-    printf("\nReady. Connect your sender to ws://localhost:%d\n", args.ws_port);
-    printf("Use the console keyboard or launcher buttons for simulator inputs.\n\n");
+    printf("\nReady. Connect your sender to");
+    if (args.ws_port)
+        printf(" ws://localhost:%d", args.ws_port);
+    if (usb_path)
+        printf("%s %s", args.ws_port ? " or" : "", usb_path);
+    printf("\nUse the console keyboard or launcher buttons for simulator inputs.\n\n");
 
     // Main loop: run simulation while polling stdin controls.
     while (sim.exit != exit_OK) {
+        // Service the sender ports
+        if (usb_path)
+            usb_host_service();
+        ws_service();
+
         // Run one frame of simulation
         uint64_t frame_ticks = F_CPU / 100;
         uint64_t target = sim.masterclock + frame_ticks;
@@ -183,6 +212,7 @@ int main(int argc, char *argv[])
     platform_kill_thread(th);
 
     ws_shutdown();
+    usb_host_shutdown();
 
     platform_terminate();
 

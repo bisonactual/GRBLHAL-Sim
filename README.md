@@ -1,6 +1,6 @@
 # grblHAL FlexiHAL Simulator
 
-A cross-platform simulator for the FlexiHAL grblHAL controller profile used by Expatria. It compiles the real grblHAL core with a virtual HAL driver and exposes the controller to G-code senders over WebSocket.
+A cross-platform simulator for the FlexiHAL grblHAL controller profile used by Expatria. It compiles the real grblHAL core with a virtual HAL driver and exposes the controller to G-code senders over USB serial and WebSocket, the same two ways the board connects.
 
 This is a fixed simulator build, not a runtime firmware uploader. The bundled profile currently targets an Expatria Flexi-HAL style STM32F446 controller with 5 axes, PWM spindle, flood/mist coolant, probe, safety door, E-stop, simulated EEPROM, simulated SD card, and the active bundled simulation plugins: Sienci ATCi and Exclusion Zones.
 
@@ -10,9 +10,9 @@ It is used for Flexisender development, but it can also be used with other WebSo
 
 - Runs the real grblHAL parser, planner, state machine, settings, alarms, and reports on a PC.
 - Emulates the FlexiHAL hardware surface used by the current simulator profile.
-- Lets senders such as gSender, CNCjs, and UGS connect to `ws://localhost:8080`.
-- Keeps simulator controls local through stdin, so the sender WebSocket remains sender-only.
-- Persists settings in an EEPROM file.
+- Lets senders such as gSender, CNCjs, and UGS connect to `ws://localhost:8080`, or over USB serial (`-u`).
+- Keeps simulator controls local through stdin, so the sender connections remain sender-only.
+- Persists settings in an EEPROM file, written through in place on every change like the board's EEPROM/FRAM, so a killed simulator keeps them.
 - Provides a host-backed `sdcard/` folder for grblHAL VFS and tool table style workflows.
 - Includes a native Windows launcher for start/stop, port settings, persisted options, controller-state display, log viewing, and simulator input buttons.
 
@@ -118,10 +118,22 @@ Connect your sender to:
 ws://localhost:8080
 ```
 
+or, with `-u`, to the simulated USB serial port.
+
+## USB and Network
+
+The simulator's streams match the board's:
+
+- **USB serial is the base stream**, flagged as USB, connected while the sender holds the port open (the board uses DTR). Sender opening the port gets the welcome message, as on the board.
+  - Linux/macOS: `-u /tmp/flexihal-usb` creates a pseudo-terminal and a symlink to it; point the sender (or `pyserial`) at the symlink.
+  - Windows: `-u COM7` opens an existing COM port, typically one end of a [com0com](https://com0com.sourceforge.net/) pair; the sender opens the other end. The sender's DTR arrives as the simulator's DSR.
+- **The WebSocket client is a stream of its own** (`StreamType_WebSocket`). It takes over with `stream_connect()` when the handshake completes ("WEBSOCKET STREAM ACTIVE" goes to the previous stream) and hands back to USB with `stream_disconnect()` when the client closes, dropping its unread input, as the networking plugin does on the board.
+
 ## Command-Line Options
 
 ```text
--w <port>   WebSocket port for sender connection (default: 8080)
+-w <port>   WebSocket port for sender connection (default: 8080, 0 = off)
+-u <path>   USB serial: symlink to create (Linux/macOS) or COM port (Windows)
 -t <speed>  Realtime speed multiplier (default: 1.0, 0 = max speed)
 -e <file>   EEPROM/settings file (default: EEPROM.DAT)
 -r <time>   Step report interval in seconds (0 = off)
@@ -183,9 +195,12 @@ grblhal-sim/
 │   ├── grbl/                # grblHAL core submodule
 │   ├── driver.c/h           # FlexiHAL virtual HAL driver
 │   ├── main.c               # Simulator entry point
-│   ├── websocket.c/h        # Sender WebSocket server
+│   ├── serial.c/h           # USB serial stream (base stream)
+│   ├── usb_host.c/h         # Host side of the USB port: pseudo-terminal or COM port
+│   ├── websocket.c/h        # WebSocket server and WebSocket stream
 │   ├── fs_sim.c/h           # Host-backed simulated SD card
 │   ├── eeprom.c/h           # NVS persistence to file
+│   ├── shared.h             # Values shared between grblHAL's thread and the main thread
 │   ├── my_plugin.c          # Bundled plugin entry points
 │   └── platform_*.c/h       # OS abstraction
 └── ui/windows-launcher/      # Native Windows launcher
@@ -196,6 +211,8 @@ grblhal-sim/
 - The sender WebSocket is only for sender/controller traffic.
 - Simulator hardware events are injected through stdin.
 - The upstream grblHAL core is kept as a clean submodule; simulator compatibility changes are applied from `packaging/grbl-core-flexihal-sim.patch` into the build tree.
+- `packaging/grbl-core-nvs-offset.patch` fixes an upstream bug that only shows on x86 hosts: `nvs_buffer_sync_physical()` holds NVS addresses in a `uint_fast8_t`, which is 8 bits there, so work offsets, startup lines and tool data were never written to the EEPROM file. Boards with a 32-bit `uint_fast8_t` are not affected.
+- `-DFLIGHT_RECORDER_DIR=<path>` builds in the Flight-Recorder plugin and its core patch from that repository.
 - GitHub Actions builds Linux, Windows, and macOS packages on pushes, pull requests, and tags.
 - Runtime UF2 firmware upload and browser plugin rebuilds were removed because this distributable targets one known FlexiHAL profile.
 - Future firmware-profile loading should be added as a separate explicit simulator feature, not as source upload and rebuild from the browser.

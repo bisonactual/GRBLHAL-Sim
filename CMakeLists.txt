@@ -31,13 +31,31 @@ set(plugin_SRC
     plugins/exclusion_zones.c
 )
 
+set(GRBL_CORE_PATCHES
+    "${CMAKE_SOURCE_DIR}/packaging/grbl-core-flexihal-sim.patch"
+    # Upstream bug, visible on x86 hosts only: the NVS sync offset is
+    # uint_fast8_t (8 bits there), so work offsets were never saved.
+    "${CMAKE_SOURCE_DIR}/packaging/grbl-core-nvs-offset.patch"
+)
+
+# Optional: the Flight-Recorder plugin and its core patch, from its own repo.
+set(FLIGHT_RECORDER_DIR "" CACHE PATH "Flight-Recorder repository to build in (optional)")
+if(FLIGHT_RECORDER_DIR)
+    add_compile_definitions(FLIGHT_RECORDER_ENABLE=1)
+    list(APPEND GRBL_CORE_PATCHES "${FLIGHT_RECORDER_DIR}/core/executing-line.patch")
+    list(APPEND plugin_SRC
+        "${FLIGHT_RECORDER_DIR}/plugin/flight_recorder.c"
+        "${FLIGHT_RECORDER_DIR}/plugin/event_log.c"
+        "${FLIGHT_RECORDER_DIR}/plugin/storage_file.c"
+    )
+endif()
+
 # grblHAL core
 # Keep the upstream grblHAL/core submodule clean and apply our simulator
-# compatibility patch into the build tree.
+# compatibility patch (and any plugin patches) into the build tree.
 find_package(Git REQUIRED)
 
 set(GRBL_CORE_SOURCE_DIR "${CMAKE_SOURCE_DIR}/src/grbl")
-set(GRBL_CORE_PATCH "${CMAKE_SOURCE_DIR}/packaging/grbl-core-flexihal-sim.patch")
 set(GRBL_CORE_BUILD_ROOT "${CMAKE_BINARY_DIR}/patched-src")
 set(GRBL_CORE_BUILD_DIR "${GRBL_CORE_BUILD_ROOT}/grbl")
 
@@ -46,18 +64,20 @@ file(MAKE_DIRECTORY "${GRBL_CORE_BUILD_DIR}")
 file(COPY "${GRBL_CORE_SOURCE_DIR}/" DESTINATION "${GRBL_CORE_BUILD_DIR}"
      PATTERN ".git" EXCLUDE)
 
-execute_process(
-    COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${GRBL_CORE_PATCH}"
-    WORKING_DIRECTORY "${GRBL_CORE_BUILD_DIR}"
-    RESULT_VARIABLE GRBL_CORE_PATCH_RESULT
-    OUTPUT_VARIABLE GRBL_CORE_PATCH_OUTPUT
-    ERROR_VARIABLE GRBL_CORE_PATCH_ERROR
-)
-if(NOT GRBL_CORE_PATCH_RESULT EQUAL 0)
-    message(FATAL_ERROR
-        "Failed to apply grblHAL core simulator patch:\n"
-        "${GRBL_CORE_PATCH_OUTPUT}\n${GRBL_CORE_PATCH_ERROR}")
-endif()
+foreach(GRBL_CORE_PATCH ${GRBL_CORE_PATCHES})
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" apply --whitespace=nowarn "${GRBL_CORE_PATCH}"
+        WORKING_DIRECTORY "${GRBL_CORE_BUILD_DIR}"
+        RESULT_VARIABLE GRBL_CORE_PATCH_RESULT
+        OUTPUT_VARIABLE GRBL_CORE_PATCH_OUTPUT
+        ERROR_VARIABLE GRBL_CORE_PATCH_ERROR
+    )
+    if(NOT GRBL_CORE_PATCH_RESULT EQUAL 0)
+        message(FATAL_ERROR
+            "Failed to apply grblHAL core patch ${GRBL_CORE_PATCH}:\n"
+            "${GRBL_CORE_PATCH_OUTPUT}\n${GRBL_CORE_PATCH_ERROR}")
+    endif()
+endforeach()
 
 include("${GRBL_CORE_BUILD_DIR}/CMakeLists.txt")
 
@@ -94,6 +114,7 @@ add_executable(grblHAL_flexihal_sim
     src/mcu.c
     src/serial.c
     src/grbl_interface.c
+    src/usb_host.c
     src/websocket.c
     src/my_plugin.c
     src/fs_sim.c
@@ -107,6 +128,7 @@ target_include_directories(grblHAL_flexihal_sim PRIVATE
     ${GRBL_CORE_BUILD_ROOT}
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/plugins
+    ${FLIGHT_RECORDER_DIR}/plugin
 )
 
 set(sim_LIBS

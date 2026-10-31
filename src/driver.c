@@ -11,6 +11,7 @@
 #include "mcu.h"
 #include "driver.h"
 #include "serial.h"
+#include "websocket.h"
 #include "eeprom.h"
 #include "grbl_eeprom_extensions.h"
 #include "platform.h"
@@ -243,6 +244,7 @@ bool driver_setup(settings_t *settings)
 
 void sim_process_realtime(uint_fast16_t state)
 {
+    ws_stream_poll();
     on_execute_realtime(state);
 }
 
@@ -321,7 +323,9 @@ bool driver_init(void)
     /* Simulated homing — no real switches, just zero position and mark homed */
     grbl.home_machine = sim_home_machine;
 
-    memcpy(&hal.stream, serialInit(), sizeof(io_stream_t));
+    // Register the USB stream as the base stream, as the board's driver does,
+    // so a network stream can take over and hand back on disconnect.
+    stream_connect(serialInit());
     hal.nvs.type = NVS_EEPROM;
     hal.nvs.get_byte = eeprom_get_char;
     hal.nvs.put_byte = eeprom_put_char;

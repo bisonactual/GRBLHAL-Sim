@@ -16,13 +16,13 @@
 // Initialize WebSocket server on given port. Returns 0 on success.
 int ws_init(uint16_t port);
 
-// Non-blocking: accept new connections, read incoming data.
-// Returns next available byte from client, or 0 if none.
-uint8_t ws_getchar(void);
+// Called from the main thread once per frame. Accepts a client, reads its frames into
+// the stream's receive buffer and sends the queued output, a frame per line.
+void ws_service(void);
 
-// Send a byte to the connected WebSocket client.
-// Buffers internally and flushes on newline.
-void ws_putchar(uint8_t data);
+// Called on the grblHAL thread, from on_execute_realtime. Connects or disconnects the
+// WebSocket stream to follow the client, like the networking plugin does.
+void ws_stream_poll(void);
 
 // Drop outbound grblHAL data while keeping the client socket connected.
 // Returns the new mute state.

@@ -233,7 +233,9 @@ static void print_steps(bool force)
         if (current_block == NULL)
             return;
         fprintf(args.step_out_file, "# block number %d\n", block_number++);
-    } else if ((current_block && sim.sim_time >= next_print_time) || force) {
+    } else if (((current_block || st_is_stepping()) && sim.sim_time >= next_print_time) || force) {
+        // Keep reporting until the steppers stop. The planner hands its last block
+        // to the segment buffer before the motion has actually finished.
         fprintf(args.step_out_file, "%12.5f %d, %d, %d\n",
                 sim.sim_time, sys.position[X_AXIS], sys.position[Y_AXIS], sys.position[Z_AXIS]);
         fflush(args.step_out_file);

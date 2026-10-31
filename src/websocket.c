@@ -1,16 +1,29 @@
 /*
-  websocket.c - Minimal RFC 6455 WebSocket server
+  websocket.c - Minimal RFC 6455 WebSocket server and grblHAL WebSocket stream
 
   Part of grblHAL FlexiHAL Simulator
 
   Hand-rolled WebSocket implementation using only BSD sockets.
   Supports a single client connection at a time (sufficient for sender use).
   Handles text frames, ping/pong, and close frames.
+
+  The client is a grblHAL stream of its own (StreamType_WebSocket), connected
+  with stream_connect() when the handshake completes and dropped with
+  stream_disconnect() when the client goes, as the networking plugin does on
+  the real board. The socket is serviced from the simulator's main thread; the
+  stream functions run on the grblHAL thread; the two meet in ring buffers.
 */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+// grblHAL's headers have to come first. vfs.h has a field called st_mtime, and
+// <sys/stat.h>, which the socket headers pull in, defines that as a macro.
+#include "grbl/hal.h"
+#include "grbl/protocol.h"
+
+#include "shared.h"
 
 #ifdef WIN32
 #include <winsock2.h>
@@ -115,17 +128,16 @@ static void base64_encode(const uint8_t *in, size_t len, char *out)
     out[j] = '\0';
 }
 
-// --- WebSocket state ---
+// --- WebSocket state (main thread) ---
 
 static socket_t listen_fd = SOCK_INVALID;
 static socket_t client_fd = SOCK_INVALID;
-static bool ws_handshake_done = false;
 static bool ws_tx_muted = false;
 
-// Receive ring buffer
-#define WS_RX_BUF_SIZE 4096
-static uint8_t rx_buf[WS_RX_BUF_SIZE];
-static volatile uint16_t rx_head = 0, rx_tail = 0;
+// Client state shared with the grblHAL thread. client_gen counts handshakes,
+// so a reconnect between two polls still shows up as a disconnect.
+static volatile bool client_up = false;
+static volatile uint32_t client_gen = 0;
 
 // Transmit line buffer
 #define WS_TX_BUF_SIZE 512
@@ -136,6 +148,15 @@ static uint16_t tx_len = 0;
 #define RAW_BUF_SIZE 4096
 static uint8_t raw_buf[RAW_BUF_SIZE];
 static int raw_len = 0;
+
+// --- Stream buffers (main thread <-> grblHAL thread) ---
+
+#define WS_TX_RING_SIZE 8192 // must be a power of 2
+
+static stream_rx_buffer_t rxbuffer = {0};
+static uint8_t tx_ring[WS_TX_RING_SIZE];
+static volatile uint_fast16_t tx_head = 0, tx_tail = 0;
+static enqueue_realtime_command_ptr enqueue_realtime_command = protocol_enqueue_realtime_command;
 
 static void set_nonblocking(socket_t fd)
 {
@@ -148,13 +169,31 @@ static void set_nonblocking(socket_t fd)
 #endif
 }
 
+// Real-time commands go straight to grblHAL and everything else into the stream's
+// receive buffer, the way a UART interrupt would handle it.
 static void rx_push(uint8_t c)
 {
-    uint16_t next = (rx_head + 1) % WS_RX_BUF_SIZE;
-    if (next != rx_tail) {
-        rx_buf[rx_head] = c;
-        rx_head = next;
+    if (enqueue_realtime_command(c))
+        return;
+
+    uint_fast16_t next = (rxbuffer.head + 1) & (RX_BUFFER_SIZE - 1);
+    if (next == shared_load(rxbuffer.tail))
+        rxbuffer.overflow = 1;
+    else {
+        rxbuffer.data[rxbuffer.head] = c;
+        shared_store(rxbuffer.head, next);
     }
+}
+
+static void client_closed(const char *reason)
+{
+    sock_close(client_fd);
+    client_fd = SOCK_INVALID;
+    shared_store(client_up, false);
+    raw_len = 0;
+    tx_len = 0;
+    shared_store(tx_tail, shared_load(tx_head));
+    printf("[WS] %s\n", reason);
 }
 
 // --- Blocking recv helper (with timeout) for handshake only ---
@@ -294,11 +333,7 @@ static void process_raw_buffer(void)
                     rx_push(payload[i]);
                 break;
             case 0x08: // Close
-                printf("[WS] Client sent close frame\n");
-                sock_close(client_fd);
-                client_fd = SOCK_INVALID;
-                ws_handshake_done = false;
-                raw_len = 0;
+                client_closed("Client sent close frame");
                 return;
             case 0x09: { // Ping -> Pong
                 uint8_t pong_header[2] = {0x8A, 0x00};
@@ -328,25 +363,15 @@ static void process_incoming(void)
         raw_len += n;
         process_raw_buffer();
     } else if (n == 0) {
-        // Clean disconnect
-        sock_close(client_fd);
-        client_fd = SOCK_INVALID;
-        ws_handshake_done = false;
-        raw_len = 0;
-        printf("[WS] Client disconnected\n");
+        client_closed("Client disconnected");
     } else {
         // n < 0
 #ifdef WIN32
-        if (sock_errno != SOCK_WOULDBLOCK) {
+        if (sock_errno != SOCK_WOULDBLOCK)
 #else
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
 #endif
-            sock_close(client_fd);
-            client_fd = SOCK_INVALID;
-            ws_handshake_done = false;
-            raw_len = 0;
-            printf("[WS] Client connection error\n");
-        }
+            client_closed("Client connection error");
         // EAGAIN/WOULDBLOCK is fine — just no data right now
     }
 }
@@ -355,7 +380,7 @@ static void process_incoming(void)
 
 static void ws_send_frame(const uint8_t *data, size_t len)
 {
-    if (client_fd == SOCK_INVALID || !ws_handshake_done) return;
+    if (client_fd == SOCK_INVALID) return;
 
     uint8_t header[10];
     size_t hlen = 0;
@@ -380,7 +405,144 @@ static void ws_send_frame(const uint8_t *data, size_t len)
     send(client_fd, (char *)data, (int)len, 0);
 }
 
-// --- Public API ---
+// Empties the stream's transmit ring into frames, one per line as before.
+static void process_outgoing(void)
+{
+    while (tx_tail != shared_load(tx_head)) {
+        uint8_t data = tx_ring[tx_tail];
+        shared_store(tx_tail, (tx_tail + 1) & (WS_TX_RING_SIZE - 1));
+
+        if (ws_tx_muted)
+            continue;
+
+        tx_buf[tx_len++] = data;
+        if (data == '\n' || data == '\r' || tx_len >= WS_TX_BUF_SIZE - 1) {
+            ws_send_frame(tx_buf, tx_len);
+            tx_len = 0;
+        }
+    }
+}
+
+// --- grblHAL stream (grblHAL thread) ---
+
+static int32_t wsGetC(void)
+{
+    int32_t data;
+    uint_fast16_t bptr = rxbuffer.tail;
+
+    if (bptr == shared_load(rxbuffer.head))
+        return -1;
+
+    data = (int32_t)rxbuffer.data[bptr++];
+    shared_store(rxbuffer.tail, bptr & (RX_BUFFER_SIZE - 1));
+    return data;
+}
+
+static uint16_t wsRxCount(void)
+{
+    uint_fast16_t head = shared_load(rxbuffer.head), tail = shared_load(rxbuffer.tail);
+    return BUFCOUNT(head, tail, RX_BUFFER_SIZE);
+}
+
+static uint16_t wsRxFree(void)
+{
+    return (RX_BUFFER_SIZE - 1) - wsRxCount();
+}
+
+static void wsRxFlush(void)
+{
+    shared_store(rxbuffer.tail, shared_load(rxbuffer.head));
+    rxbuffer.overflow = false;
+}
+
+static void wsRxCancel(void)
+{
+    wsRxFlush();
+    rxbuffer.data[rxbuffer.head] = ASCII_CAN;
+    shared_store(rxbuffer.head, (rxbuffer.tail + 1) & (RX_BUFFER_SIZE - 1));
+}
+
+static bool wsPutC(const uint8_t c)
+{
+    uint_fast16_t next_head = (tx_head + 1) & (WS_TX_RING_SIZE - 1);
+
+    while (next_head == shared_load(tx_tail)) {
+        if (!shared_load(client_up))
+            return true;
+        if (!hal.stream_blocking_callback())
+            return false;
+    }
+
+    if (shared_load(client_up)) {
+        tx_ring[tx_head] = c;
+        shared_store(tx_head, next_head);
+    }
+
+    return true;
+}
+
+static void wsWriteS(const char *data)
+{
+    uint8_t c, *ptr = (uint8_t *)data;
+    while ((c = *ptr++) != '\0')
+        wsPutC(c);
+}
+
+static bool wsSuspendInput(bool suspend)
+{
+    return stream_rx_suspend(&rxbuffer, suspend);
+}
+
+static bool wsIsConnected(void)
+{
+    return client_up;
+}
+
+static enqueue_realtime_command_ptr wsSetRtHandler(enqueue_realtime_command_ptr handler)
+{
+    enqueue_realtime_command_ptr prev = enqueue_realtime_command;
+    if (handler)
+        enqueue_realtime_command = handler;
+    return prev;
+}
+
+static const io_stream_t ws_stream = {
+    .type = StreamType_WebSocket,
+    .is_connected = wsIsConnected,
+    .read = wsGetC,
+    .write = wsWriteS,
+    .write_char = wsPutC,
+    .write_all = wsWriteS,
+    .get_rx_buffer_free = wsRxFree,
+    .get_rx_buffer_count = wsRxCount,
+    .reset_read_buffer = wsRxFlush,
+    .cancel_read_buffer = wsRxCancel,
+    .suspend_read = wsSuspendInput,
+    .set_enqueue_rt_handler = wsSetRtHandler
+};
+
+void ws_stream_poll(void)
+{
+    static bool connected = false;
+    static uint32_t connected_gen = 0;
+
+    bool up = shared_load(client_up);
+    uint32_t gen = shared_load(client_gen);
+
+    if (connected && (!up || gen != connected_gen)) {
+        connected = false;
+        stream_disconnect(&ws_stream);
+        wsRxFlush();
+    }
+
+    if (!connected && up) {
+        connected = true;
+        connected_gen = gen;
+        stream_connect(&ws_stream);
+    }
+}
+
+// --- Public API (main thread) ---
 
 int ws_init(uint16_t port)
 {
@@ -417,8 +579,11 @@ int ws_init(uint16_t port)
     return 0;
 }
 
-uint8_t ws_getchar(void)
+void ws_service(void)
 {
+    if (listen_fd == SOCK_INVALID)
+        return;
+
     // Try to accept new connection
     if (client_fd == SOCK_INVALID) {
         struct sockaddr_in caddr;
@@ -434,8 +599,10 @@ uint8_t ws_getchar(void)
                 int flag = 1;
                 setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag));
                 client_fd = fd;
-                ws_handshake_done = true;
                 raw_len = 0;
+                tx_len = 0;
+                shared_store(client_gen, client_gen + 1);
+                shared_store(client_up, true);
                 printf("[WS] Client connected and ready\n");
             } else {
                 printf("[WS] Handshake failed, closing\n");
@@ -445,34 +612,11 @@ uint8_t ws_getchar(void)
     }
 
     // Read from connected client
-    if (client_fd != SOCK_INVALID && ws_handshake_done)
+    if (client_fd != SOCK_INVALID)
         process_incoming();
 
-    // Return from ring buffer
-    if (rx_head != rx_tail) {
-        uint8_t c = rx_buf[rx_tail];
-        rx_tail = (rx_tail + 1) % WS_RX_BUF_SIZE;
-        return c;
-    }
-
-    return 0;
-}
-
-void ws_putchar(uint8_t data)
-{
-    if (client_fd == SOCK_INVALID || !ws_handshake_done) return;
-    if (ws_tx_muted) {
-        tx_len = 0;
-        return;
-    }
-
-    tx_buf[tx_len++] = data;
-
-    // Flush on newline or buffer full
-    if (data == '\n' || data == '\r' || tx_len >= WS_TX_BUF_SIZE - 1) {
-        ws_send_frame(tx_buf, tx_len);
-        tx_len = 0;
-    }
+    if (client_fd != SOCK_INVALID)
+        process_outgoing();
 }
 
 bool ws_toggle_tx_muted(void)
@@ -488,20 +632,14 @@ bool ws_kick_client(void)
     if (client_fd == SOCK_INVALID)
         return false;
 
-    sock_close(client_fd);
-    client_fd = SOCK_INVALID;
-    ws_handshake_done = false;
-    raw_len = 0;
-    tx_len = 0;
+    client_closed("Client kicked");
     return true;
 }
 
 void ws_shutdown(void)
 {
-    if (client_fd != SOCK_INVALID) {
-        sock_close(client_fd);
-        client_fd = SOCK_INVALID;
-    }
+    if (client_fd != SOCK_INVALID)
+        client_closed("Shutting down");
     if (listen_fd != SOCK_INVALID) {
         sock_close(listen_fd);
         listen_fd = SOCK_INVALID;
